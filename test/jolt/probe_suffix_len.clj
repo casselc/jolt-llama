@@ -45,7 +45,7 @@
             (llama/eval! s base)
             (let [st (llama/save-state s)]
               (llama/clear! s)
-              (llama/load-state! s st {:for-tokens full})
+              (llama/load-state! s st full)
               (llama/eval! s suffix)
               (let [b (llama/top-k s 50 {:pieces? false})
                     lpb (into {} (map (juxt :token :logprob) b))

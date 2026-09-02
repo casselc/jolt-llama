@@ -257,7 +257,7 @@
             (llama/eval! s base)
             (let [st (llama/save-state s)]
               (llama/clear! s)
-              (llama/load-state! s st {:for-tokens toks})
+              (llama/load-state! s st toks)
               (llama/eval! s suffix)
               (let [d (max-delta plain (topk-map s 50))]
                 (when-not (zero? d)
@@ -292,7 +292,7 @@
                 (llama/eval! s base)
                 (let [st (llama/save-state s)]
                   (llama/clear! s)
-                  (llama/load-state! s st {:for-tokens toks})
+                  (llama/load-state! s st toks)
                   (llama/eval! s suffix)
                   (let [d (max-delta onepass (topk-map s 50))]
                     (when-not (zero? d)
@@ -347,12 +347,198 @@
                   i (h/draw! (g/integer 0 (dec (count toks))))
                   bad (assoc (vec toks) i (mod (+ 7 (nth toks i)) 1000))]
               (llama/clear! s)
-              (let [refused? (try (llama/load-state! s st {:for-tokens bad}) false
+              (let [refused? (try (llama/load-state! s st bad) false
                                   (catch Throwable e
                                     (= :state/prefix-mismatch (:jolt.llama/error (ex-data e)))))]
                 (when-not refused?
                   (throw (ex-info "a mismatched prefix was accepted"
                                   {:hegel/origin "state/mismatch-refused"}))))))))))))
+
+
+;; ------------------------------------------------------------ ownership
+
+(defn check-model-close-is-refused-while-sessions-live! [runner]
+  (report/run!
+   runner
+   "a model with live sessions refuses to close, for any interleaving"
+   (fn []
+     (h/run-test!
+      {:test-cases 25 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; A jl_session holds its jl_model* AND a llama_context built from that
+        ;; model's llama_model. Closing the model underneath a live session is a
+        ;; use-after-free the caller cannot detect, so it must be refused --
+        ;; and the model must remain usable afterwards, since a refusal that
+        ;; damaged the model would only move the bug.
+        ;;
+        ;; A fresh model per case: this property is ABOUT closing models, so it
+        ;; cannot share the suite's.
+        (let [n (h/draw! (g/integer 1 3))
+              m2 (llama/open-model {:path model-path})
+              sessions (atom [])]
+          (try
+            (dotimes [_ n]
+              (swap! sessions conj (llama/new-session m2 {:context-size 256 :threads 2})))
+            ;; every prefix of the close sequence must still refuse
+            (loop [remaining @sessions]
+              (when (seq remaining)
+                (let [refused? (try (llama/close! m2) false
+                                    (catch Throwable e
+                                      (= :model/sessions-active
+                                         (:jolt.llama/error (ex-data e)))))]
+                  (when-not refused?
+                    (throw (ex-info "model closed with live sessions"
+                                    {:hegel/origin "ownership/model-close-refused"
+                                     :live (count remaining)})))
+                  ;; and the refusal must be non-destructive
+                  (when-not (pos? (:n-vocab m2))
+                    (throw (ex-info "a refused close damaged the model"
+                                    {:hegel/origin "ownership/refusal-is-nondestructive"})))
+                  (llama/close! (first remaining))
+                  (recur (rest remaining)))))
+            ;; with every session closed it must now succeed
+            (when-not (= :closed (llama/close! m2))
+              (throw (ex-info "model would not close after all sessions closed"
+                              {:hegel/origin "ownership/close-after-drain"})))
+            (finally
+              (doseq [s @sessions] (try (llama/close! s) (catch Throwable _ nil)))
+              (try (llama/close! m2) (catch Throwable _ nil))))))))))
+
+(defn check-use-after-close-is-refused! [runner]
+  (report/run!
+   runner
+   "using a closed model or session is refused, never a crash"
+   (fn []
+     (h/run-test!
+      {:test-cases 20 :database "" :verbosity :quiet}
+      (fn [_]
+        (let [m2 (llama/open-model {:path model-path})
+              s (llama/new-session m2 {:context-size 256 :threads 2})
+              op (h/draw! (g/sampled-from [:eval :logits :save :clear :new-session]))]
+          (llama/close! s)
+          (llama/close! m2)
+          ;; the process surviving all of these IS the property
+          (let [threw? (try
+                         (case op
+                           :eval        (llama/eval! s [1 2 3])
+                           :logits      (llama/logits s)
+                           :save        (llama/save-state s)
+                           :clear       (llama/clear! s)
+                           :new-session (llama/new-session m2 {:context-size 256 :threads 2}))
+                         false
+                         (catch Throwable e
+                           (= :handle/closed (:jolt.llama/error (ex-data e)))))]
+            (when-not threw?
+              (throw (ex-info "a closed handle was used"
+                              {:hegel/origin "ownership/use-after-close"
+                               :op op}))))))))))
+
+(defn check-v0-is-single-sequence! [runner]
+  (report/run!
+   runner
+   "v0 refuses every sequence but 0"
+   (fn []
+     (h/run-test!
+      {:test-cases 30 :database "" :verbosity :quiet}
+      (fn [_]
+        (let [sq (h/draw! (g/integer 1 8))]
+          (when-not (try (llama/new-session model {:context-size 256 :seq-max (inc sq)}) false
+                         (catch Throwable e (= :seq/unsupported (:jolt.llama/error (ex-data e)))))
+            (throw (ex-info "seq-max > 1 accepted"
+                            {:hegel/origin "seq/seq-max-refused"})))
+          (llama/clear! state-session)
+          (llama/eval! state-session (vec (tok (probe-text 2))))
+          (when-not (try (llama/eval! state-session [1] {:seq-id sq}) false
+                         (catch Throwable e (= :seq/unsupported (:jolt.llama/error (ex-data e)))))
+            (throw (ex-info "nonzero seq-id accepted by eval!"
+                            {:hegel/origin "seq/eval-refused"})))))))))
+
+(defn check-eval-is-append-only! [runner]
+  (report/run!
+   runner
+   "evaluation is append-only and there is no way to ask otherwise"
+   (fn []
+     (h/run-test!
+      {:test-cases 20 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; The public API has no :pos, so the property is that appending always
+        ;; lands at the current end and the ledger tracks it exactly.
+        (let [a (h/draw! (g/integer 1 6))
+              b (h/draw! (g/integer 1 6))
+              toks (vec (tok (probe-text 3)))]
+          (llama/clear! state-session)
+          (let [r1 (llama/eval! state-session (vec (take a toks)))]
+            (when-not (zero? (:pos r1))
+              (throw (ex-info "first eval did not start at 0"
+                              {:hegel/origin "append/starts-at-zero"})))
+            (let [r2 (llama/eval! state-session (vec (take b (drop a toks))))]
+              (when-not (= (:pos r2) (:n-resident r1))
+                (throw (ex-info "append did not continue at the resident end"
+                                {:hegel/origin "append/continues-at-end"
+                                 :pos (:pos r2) :expected (:n-resident r1)})))))))))))
+
+;; ---------------------------------------------------- state compatibility
+
+(defn check-incompatible-state-is-refused! [runner]
+  (report/run!
+   runner
+   "a state descriptor that does not match is refused, with the reason named"
+   (fn []
+     (h/run-test!
+      {:test-cases 30 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Each mutation targets one field of the compatibility coordinate, and
+        ;; each must be refused with ITS OWN keyword -- a single :incompatible
+        ;; would not be auditable, and would hide which check actually fired.
+        (let [toks (vec (tok (probe-text 3)))
+              _ (llama/clear! state-session)
+              _ (llama/eval! state-session toks)
+              st (llama/save-state state-session)
+              which (h/draw! (g/sampled-from
+                              [:model :abi :seq :token-hash :blob-hash :blob-size :malformed]))
+              [bad expected]
+              (case which
+                :model      [(assoc st :model-content-id "sha256:deadbeef") :state/model-mismatch]
+                :abi        [(assoc st :abi 99) :state/abi-mismatch]
+                :seq        [(assoc st :seq-id 1) :seq/unsupported]
+                :token-hash [(assoc st :token-hash "00000000") :state/token-hash-mismatch]
+                :blob-hash  [(assoc st :state-hash "00000000") :state/blob-hash-mismatch]
+                :blob-size  [(assoc st :state-bytes 1) :state/blob-size-mismatch]
+                :malformed  [(dissoc st :tokens) :state/malformed])
+              got (try (llama/load-state! state-session bad toks) :accepted
+                       (catch Throwable e (:jolt.llama/error (ex-data e))))]
+          (when-not (= expected got)
+            (throw (ex-info "wrong refusal for a mutated state descriptor"
+                            {:hegel/origin (str "state/refuses-" (name which))
+                             :expected expected :got got})))))))))
+
+(defn check-same-artifact-different-handle-is-accepted! [runner]
+  (report/run!
+   runner
+   "state moves between two handles on the SAME model artifact"
+   (fn []
+     (h/run-test!
+      {:test-cases 3 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Pointer identity is NOT the semantic model identity. Two independently
+        ;; opened handles over the same GGUF are the same model, and refusing
+        ;; that restore would be a false negative -- the kind that teaches
+        ;; callers to reach for an unchecked path.
+        (let [toks (vec (tok (probe-text 3)))
+              _ (llama/clear! state-session)
+              _ (llama/eval! state-session toks)
+              st (llama/save-state state-session)
+              m2 (llama/open-model {:path model-path})]
+          (try
+            (let [s2 (llama/new-session m2 {:context-size 2048 :threads 4})]
+              (try
+                (when-not (= (:content-id m2) (:model-content-id st))
+                  (throw (ex-info "the same artifact produced a different content id"
+                                  {:hegel/origin "state/content-id-is-stable"})))
+                (llama/load-state! s2 st toks)
+                (llama/eval! s2 [(:token (first (llama/top-k state-session 1 {:pieces? false})))])
+                (finally (llama/close! s2))))
+            (finally (llama/close! m2)))))))))
 
 ;; ----------------------------------------------------------------- main
 
@@ -365,6 +551,16 @@
     (println "--- lifecycle properties ---")
     (check-illegal-lifecycle-is-safe! runner)
     (check-close-is-idempotent! runner)
+
+    (println "--- ownership properties ---")
+    (check-model-close-is-refused-while-sessions-live! runner)
+    (check-use-after-close-is-refused! runner)
+    (check-v0-is-single-sequence! runner)
+    (check-eval-is-append-only! runner)
+
+    (println "--- state compatibility ---")
+    (check-incompatible-state-is-refused! runner)
+    (check-same-artifact-different-handle-is-accepted! runner)
 
     (println "--- state properties ---")
     (println "calibrated exact-append threshold:" (:threshold calibration)

@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
 
     if ((st = jl_session_clear(sess, 0)) != JL_OK) return fail("session_clear", st);
     size_t nread = 0;
-    if ((st = jl_state_load(sess, 0, blob, written, &nread)) != JL_OK) return fail("state_load", st);
+    if ((st = jl_state_load(sess, 0, blob, written, (int32_t) n_tok, &nread)) != JL_OK) return fail("state_load", st);
     printf("state_loaded=%zu\n", nread);
 
     /*
@@ -114,6 +114,50 @@ int main(int argc, char **argv) {
     if (jl_model_open(NULL, NULL, &model) != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null path accepted\n"); return 1; }
     if (jl_eval(sess, 0, NULL, 0, 0)   != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null tokens accepted\n"); return 1; }
     if (jl_eval(NULL, 0, toks, 1, 0)   != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null session accepted\n"); return 1; }
+    /*
+     * OWNERSHIP. A jl_session holds its jl_model* and a llama_context built
+     * from that model's llama_model, so closing the model underneath a live
+     * session is a use-after-free the caller cannot detect. It must be refused,
+     * and the model must still work afterwards.
+     */
+    if (jl_model_close(model) != JL_ERR_SESSIONS_ACTIVE) {
+        fprintf(stderr, "FAIL: model closed with a live session\n"); return 1;
+    }
+    printf("model_close_with_live_session=refused\n");
+
+    /* the refusal must be non-destructive: the model is still usable */
+    if (jl_model_n_vocab(model) <= 0) {
+        fprintf(stderr, "FAIL: refused close damaged the model\n"); return 1;
+    }
+
+    /* v0 is single-sequence */
+    if (jl_eval(sess, 1, toks, 1, jl_session_n_resident(sess)) != JL_ERR_SEQ_UNSUPPORTED) {
+        fprintf(stderr, "FAIL: nonzero seq_id accepted\n"); return 1;
+    }
+    if (jl_state_load(sess, 1, blob, written, (int32_t) n_tok, &nread) != JL_ERR_SEQ_UNSUPPORTED) {
+        fprintf(stderr, "FAIL: state load into nonzero seq accepted\n"); return 1;
+    }
+    printf("nonzero_seq=refused\n");
+
+    /* APPEND-ONLY: only the current end is a legal pos0 */
+    {
+        int32_t resident = jl_session_n_resident(sess);
+        printf("n_resident=%d\n", resident);
+        if (jl_eval(sess, 0, toks, 1, resident - 1) != JL_ERR_NOT_APPEND) {
+            fprintf(stderr, "FAIL: eval into an earlier position accepted\n"); return 1;
+        }
+        if (jl_eval(sess, 0, toks, 1, resident + 5) != JL_ERR_NOT_APPEND) {
+            fprintf(stderr, "FAIL: eval past the end accepted\n"); return 1;
+        }
+        if (jl_eval(sess, 0, toks, 1, resident) != JL_OK) {
+            fprintf(stderr, "FAIL: append at the current end rejected\n"); return 1;
+        }
+        if (jl_session_n_resident(sess) != resident + 1) {
+            fprintf(stderr, "FAIL: resident count did not advance\n"); return 1;
+        }
+        printf("append_only=ok\n");
+    }
+
     printf("negative_paths=ok\n");
 
     free(blob); free(toks);

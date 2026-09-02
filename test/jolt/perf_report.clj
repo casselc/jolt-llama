@@ -94,7 +94,7 @@
             bytes (:state-bytes st)
             load-ts (doall (for [_ (range trials)]
                              (do (llama/clear! s)
-                                 (let [t (now)] (llama/load-state! s st {:for-tokens all}) (- (now) t)))))
+                                 (let [t (now)] (llama/load-state! s st all) (- (now) t)))))
             mbps (fn [ms] (/ (/ bytes 1048576.0) (/ (max 1 ms) 1000.0)))]
         (println)
         (println (format "STATE  %d bytes (%.1f MiB) for %d tokens = %.0f bytes/token"
@@ -106,7 +106,7 @@
         ;; ---- delta append after restore
         (let [ts (doall (for [_ (range trials)]
                           (do (llama/clear! s)
-                              (llama/load-state! s st {:for-tokens all})
+                              (llama/load-state! s st all)
                               (let [t (now)] (llama/eval! s suffix) (- (now) t)))))]
           (println)
           (println "WARM PATH")
@@ -117,7 +117,7 @@
         (let [ts (doall (for [_ (range trials)]
                           (do (llama/clear! s)
                               (let [t (now)]
-                                (llama/load-state! s st {:for-tokens all})
+                                (llama/load-state! s st all)
                                 (llama/eval! s suffix)
                                 (- (now) t)))))
               cold (stat (doall (for [_ (range trials)]

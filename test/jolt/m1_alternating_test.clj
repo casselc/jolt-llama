@@ -88,7 +88,7 @@
                      suffix (vec (drop (:n-tokens st) full))
                      t0 (System/currentTimeMillis)
                      _ (llama/clear! s)
-                     _ (llama/load-state! s st {:for-tokens full})
+                     _ (llama/load-state! s st full)
                      t-restore (- (System/currentTimeMillis) t0)
                      t1 (System/currentTimeMillis)
                      _ (llama/eval! s suffix)

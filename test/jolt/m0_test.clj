@@ -23,7 +23,7 @@
     (do (println "  FAIL" label) (swap! failures conj label))))
 
 (println "abi:" (llama/abi-version))
-(check "abi is 1" (= 1 (llama/abi-version)))
+(check "abi is 2" (= 2 (llama/abi-version)))
 
 (llama/with-model [m {:path model-path}]
   (println "model:" (:desc m))
@@ -78,7 +78,7 @@
                       (catch Throwable e
                         (= :error/no-logits (:jolt.llama/error (ex-data e))))))
 
-          (llama/load-state! s st)
+          (llama/load-state! s st toks)
           ;; a restore alone yields no logits either -- the restored state has
           ;; not produced an output position yet
           (check "logits refused after restore"
@@ -95,12 +95,12 @@
           (check "prefix NOT ok when shorter"
                  (not (llama/token-prefix-ok? st (butlast toks))))
           (check "load-state! refuses a mismatched prefix"
-                 (try (llama/load-state! s st {:for-tokens (assoc (vec toks) 0 (inc (first toks)))})
+                 (try (llama/load-state! s st (assoc (vec toks) 0 (inc (first toks))))
                       false
                       (catch Throwable e
                         (= :state/prefix-mismatch (:jolt.llama/error (ex-data e))))))
           (check "load-state! accepts an exact extension"
-                 (map? (llama/load-state! s st {:for-tokens (concat toks [1])})))
+                 (map? (llama/load-state! s st (concat toks [1]))))
 
           ;; and after re-evaluating one token the distribution must be usable
           (llama/eval! s [(:token (first before))])

@@ -114,7 +114,7 @@
 
           (llama/clear! s)
           (let [t3 (now-ms)
-                _  (llama/load-state! s st {:for-tokens all-tokens})
+                _  (llama/load-state! s st all-tokens)
                 t-restore (- (now-ms) t3)
                 t4 (now-ms)
                 _  (llama/eval! s suffix)

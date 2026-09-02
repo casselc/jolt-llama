@@ -25,7 +25,9 @@
 
   Native pointers are an implementation detail. Handles are Jolt maps; a raw
   pointer never appears in a public return value."
-  (:require [jolt.ffi :as ffi]))
+  (:require [clojure.java.shell]
+            [clojure.string]
+            [jolt.ffi :as ffi]))
 
 ;; ---------------------------------------------------------------- library
 
@@ -46,18 +48,23 @@
 (ffi/defcfn ^:private c-runtime-free "jl_runtime_free" [] :int32)
 
 (ffi/defcfn ^:private c-model-params-default "jl_model_params_default" [:pointer] :void)
-(ffi/defcfn ^:private c-model-open "jl_model_open" [:pointer :pointer :pointer] :int32)
-(ffi/defcfn ^:private c-model-close "jl_model_close" [:pointer] :int32)
+(ffi/defcfn ^:private c-model-open "jl_model_open" [:pointer :pointer :pointer] :int32 :blocking)
+(ffi/defcfn ^:private c-model-close "jl_model_close" [:pointer] :int32 :blocking)
 (ffi/defcfn ^:private c-model-n-vocab "jl_model_n_vocab" [:pointer] :int32)
 (ffi/defcfn ^:private c-model-n-ctx-train "jl_model_n_ctx_train" [:pointer] :int32)
 (ffi/defcfn ^:private c-model-desc "jl_model_desc" [:pointer :pointer :size_t] :size_t)
 
 (ffi/defcfn ^:private c-session-params-default "jl_session_params_default" [:pointer] :void)
-(ffi/defcfn ^:private c-session-new "jl_session_new" [:pointer :pointer :pointer] :int32)
+(ffi/defcfn ^:private c-session-new "jl_session_new" [:pointer :pointer :pointer] :int32 :blocking)
 (ffi/defcfn ^:private c-session-close "jl_session_close" [:pointer] :int32)
 (ffi/defcfn ^:private c-session-n-ctx "jl_session_n_ctx" [:pointer] :uint32)
 (ffi/defcfn ^:private c-session-clear "jl_session_clear" [:pointer :int32] :int32)
 
+;; :blocking marks the calls that MEASURED in the hundreds of milliseconds --
+;; model open, session construction, eval, and state save/load -- so the Chez
+;; collector is not held off across them. Deliberately NOT on the scalar
+;; queries (n_vocab, n_ctx, abi_version): those return immediately and the
+;; marker would cost more than the call.
 (ffi/defcfn ^:private c-tokenize "jl_tokenize"
   [:pointer :pointer :size_t :int32 :int32 :pointer :size_t :pointer] :int32)
 (ffi/defcfn ^:private c-token-to-piece "jl_token_to_piece"
@@ -71,8 +78,9 @@
 (ffi/defcfn ^:private c-token-logprob "jl_token_logprob" [:pointer :int32 :pointer] :int32)
 
 (ffi/defcfn ^:private c-state-size "jl_state_size" [:pointer :int32 :pointer] :int32)
-(ffi/defcfn ^:private c-state-save "jl_state_save" [:pointer :int32 :pointer :size_t :pointer] :int32)
-(ffi/defcfn ^:private c-state-load "jl_state_load" [:pointer :int32 :pointer :size_t :pointer] :int32)
+(ffi/defcfn ^:private c-state-save "jl_state_save" [:pointer :int32 :pointer :size_t :pointer] :int32 :blocking)
+(ffi/defcfn ^:private c-state-load "jl_state_load"
+  [:pointer :int32 :pointer :size_t :int32 :pointer] :int32 :blocking)
 
 ;; ------------------------------------------------------------------ errors
 
@@ -80,7 +88,10 @@
   {0 :ok, -1 :error/generic, -2 :error/invalid-arg, -3 :error/alloc
    -4 :error/model-load, -5 :error/context, -6 :error/tokenize
    -7 :error/decode, -8 :error/state, -9 :error/buffer-too-small
-   -10 :error/no-logits})
+   -10 :error/no-logits
+   -11 :model/sessions-active
+   -12 :seq/unsupported
+   -13 :state/not-append})
 
 (defn- last-error-text []
   (let [n (c-last-error ffi/null 0)]
@@ -107,7 +118,14 @@
 
 ;; ------------------------------------------------------------------ runtime
 
-(def ^:private abi-expected 1)
+(def ^:private abi-expected
+  "The shim ABI this code is written against.
+
+  2 refuses jl_model_close while sessions are open, makes jl_eval append-only
+  and single-sequence, and adds the token count to jl_state_load. A v1 shim
+  would silently misread that last argument, so the check is exact, not a
+  floor."
+  2)
 
 (defn abi-version [] (c-abi-version))
 
@@ -135,6 +153,47 @@
 ;; -------------------------------------------------------------------- model
 
 (defn- read-ptr [pp] (ffi/read pp :pointer 0))
+
+(defn- gguf-content-id
+  "A stable identity for the model ARTIFACT, computed once at open.
+
+  Not the path and not the description. A path can point at different bytes
+  between two runs, and descriptions collide across quantizations of the same
+  model -- so a saved state validated against either could be restored into a
+  model that merely looks the same. Bound to content instead.
+
+  Reads the file ONCE, here. Hashing a multi-gigabyte GGUF on every state
+  operation would dominate every measurement in this repo, so nothing else in
+  the library ever touches the file.
+
+  Prefers sha256sum when present, since a real digest makes the identity
+  meaningful outside this process. Falls back to size plus a sampled digest,
+  which is weaker but still catches the cases that actually occur: a different
+  model, a different quantization, a truncated or partially-written file. The
+  fallback is LABELLED, so a state descriptor never claims more than it has."
+  [path]
+  (let [f (java.io.File. path)
+        size (.length f)]
+    (or (try
+          (let [{:keys [exit out]} (clojure.java.shell/sh "sha256sum" path)]
+            (when (zero? exit)
+              (str "sha256:" (first (clojure.string/split (clojure.string/trim out) #"\s+")))))
+          (catch Throwable _ nil))
+        ;; sampled fallback: head, middle and tail, plus the exact byte count
+        (try
+          (with-open [in (java.io.RandomAccessFile. f "r")]
+            (let [buf (byte-array 65536)
+                  spots [0 (quot size 2) (max 0 (- size 65536))]
+                  h (reduce (fn [acc off]
+                              (.seek in (long off))
+                              (let [n (max 0 (.read in buf))]
+                                (loop [i 0 a acc]
+                                  (if (>= i n) a
+                                      (recur (inc i)
+                                             (unchecked-int (+ (* 31 a) (bit-and (aget buf i) 0xff))))))))
+                            (int 17) spots)]
+              (format "sampled:%d:%08x" size (bit-and h 0xffffffff))))
+          (catch Throwable _ (str "size:" size))))))
 
 (defn open-model
   "Open a GGUF model. Returns a handle map; ::ptr is private plumbing.
@@ -170,6 +229,16 @@
            :desc desc
            :n-vocab (c-model-n-vocab ptr)
            :n-ctx-train (c-model-n-ctx-train ptr)
+           ;; The model's ARTIFACT identity, computed once here and never per
+           ;; state operation. A path and a description do not identify a
+           ;; model: two runs can hold the same path over different bytes, and
+           ;; descriptions collide across quantizations. State compatibility is
+           ;; checked against this.
+           :content-id (gguf-content-id path)
+           ;; Sessions created from this model and not yet closed. The C layer
+           ;; keeps the authoritative count; this mirror exists so the Jolt
+           ;; error can name them before the call is made.
+           :sessions (atom 0)
            :closed (atom false)})))))
 
 (defn- model-ptr [m]
@@ -189,6 +258,12 @@
   [model {:keys [context-size batch-size ubatch-size seq-max threads threads-batch]
           :or   {context-size 4096 seq-max 1 threads 4}
           :as   _opts}]
+  (when (not= 1 seq-max)
+    (throw (ex-info (str "jolt.llama/new-session: v0 is single-sequence; "
+                         ":seq-max must be 1")
+                    {:jolt.llama/op :session-new
+                     :jolt.llama/error :seq/unsupported
+                     :jolt.llama/seq-max seq-max})))
   (let [mptr (model-ptr model)
         nb   (or batch-size 2048)
         nub  (or ubatch-size nb)
@@ -205,6 +280,7 @@
       (ffi/with-out [pp :pointer]
         (check! (c-session-new mptr sp pp) :session-new {})
         (let [ptr (read-ptr pp)]
+          (swap! (:sessions model) inc)
           {::kind :session
            ::ptr ptr
            :model model
@@ -277,15 +353,30 @@
     (ffi/write buf :int32 (int t) (* i 4))))
 
 (defn eval!
-  "Evaluate tokens into a sequence, appending after whatever is resident.
+  "Evaluate tokens into the sequence, APPENDING after whatever is resident.
 
-  Updates the session's token vector so state save/reuse can be checked later."
+  Append-only, and there is no :pos option. The native recurrent/KV state is
+  not truncated to an arbitrary position, so evaluating into the middle would
+  leave the session's native state and its token vector describing different
+  sequences -- silently, and in exactly the way the token-identity contract
+  exists to detect. The shim enforces the same rule independently and answers
+  JL_ERR_NOT_APPEND; this is not the only line of defence.
+
+  To go backwards, clear! and re-evaluate, or restore a state saved at the
+  point you want.
+
+  Updates the session's token vector so a later save/restore can be checked."
   ([session tokens] (eval! session tokens {}))
-  ([session tokens {:keys [seq-id pos] :or {seq-id 0}}]
+  ([session tokens {:keys [seq-id] :or {seq-id 0}}]
+   (when (not= 0 seq-id)
+     (throw (ex-info "jolt.llama/eval!: v0 is single-sequence; :seq-id must be 0"
+                     {:jolt.llama/op :eval
+                      :jolt.llama/error :seq/unsupported
+                      :jolt.llama/seq-id seq-id})))
    (let [p (session-ptr session)
          toks (vec tokens)
          n (count toks)
-         pos0 (or pos (count @(:tokens session)))]
+         pos0 (count @(:tokens session))]
      (when (zero? n)
        (throw (ex-info "jolt.llama/eval!: empty token vector"
                        {:jolt.llama/op :eval :jolt.llama/error :error/invalid-arg})))
@@ -293,7 +384,7 @@
        (write-tokens buf toks)
        (check! (c-eval p (int seq-id) buf n (int pos0)) :eval
                {:jolt.llama/n-tokens n :jolt.llama/pos pos0}))
-     (swap! (:tokens session) #(into (vec (take pos0 %)) toks))
+     (swap! (:tokens session) into toks)
      {:n-tokens n :pos pos0 :n-resident (count @(:tokens session))})))
 
 ;; ------------------------------------------------------------------- logits
@@ -382,6 +473,12 @@
            (let [written (ffi/read np :size_t)]
              (ffi/read-into! buf blob 0 written)
              {::kind :state
+              ;; THE compatibility coordinate. :model-content-id is the one that
+              ;; decides; path and desc are kept for humans reading a descriptor
+              ;; and are explicitly NOT trusted -- a path can point at different
+              ;; bytes between runs and descriptions collide across
+              ;; quantizations of the same model.
+              :model-content-id (get-in session [:model :content-id])
               :model-desc (get-in session [:model :desc])
               :model-path (get-in session [:model :path])
               :seq-id seq-id
@@ -405,35 +502,113 @@
     (and (>= (count tokens) n)
          (= s (vec (take n tokens))))))
 
-(defn load-state!
-  "Restore exact native state, refusing anything that would need a rollback.
+(defn state-compatible?
+  "Why `state` may not be restored into `session`, or nil if it may.
 
-  When `:for-tokens` is supplied the token-identity contract is enforced: a
-  mismatch throws :state/prefix-mismatch with the divergence index, so the
-  caller can rebase or cold-evaluate deliberately. Omitting :for-tokens skips
-  the check and is only correct when the caller has already proven identity."
-  ([session state] (load-state! session state {}))
-  ([session state {:keys [seq-id for-tokens] :or {seq-id 0}}]
-   (let [p (session-ptr session)
-         blob ^bytes (::blob state)]
-     (when (and for-tokens (not (token-prefix-ok? state for-tokens)))
-       (let [s (:tokens state)
-             idx (or (first (keep-indexed (fn [i [a b]] (when (not= a b) i))
-                                          (map vector s for-tokens)))
-                     (count for-tokens))]
-         (throw (ex-info "jolt.llama/load-state!: incoming tokens do not extend the saved state"
-                         {:jolt.llama/op :state-load
-                          :jolt.llama/error :state/prefix-mismatch
-                          :jolt.llama/saved-n (count s)
-                          :jolt.llama/incoming-n (count for-tokens)
-                          :jolt.llama/diverges-at idx}))))
-     (ffi/with-alloc [buf (alength blob)]
-       (ffi/write-array buf blob)
-       (ffi/with-out [np :size_t]
-         (check! (c-state-load p (int seq-id) buf (alength blob) np) :state-load {})
-         (reset! (:tokens session) (:tokens state))
-         {:n-read (ffi/read np :size_t)
-          :n-tokens (:n-tokens state)})))))
+  Every reason is a keyword, because the caller journals the refusal and
+  \"incompatible\" without a cause is not auditable. Checked BEFORE any native
+  call: llama_state_seq_set_data given a blob from another model does not
+  reliably fail, it can succeed into nonsense.
+
+  Deliberately keyed on the model's CONTENT id rather than on handle identity.
+  Two independently opened handles over the same GGUF are the same model, and
+  treating pointer identity as semantic identity would refuse a restore that is
+  perfectly sound -- which is how callers learn to pass :unchecked."
+  [session state]
+  (let [model (:model session)]
+    (cond
+      (not (map? state))                      :state/malformed
+      (not= :state (::kind state))             :state/malformed
+      (nil? (::blob state))                    :state/malformed
+      (not (vector? (:tokens state)))          :state/malformed
+      (not= (:n-tokens state) (count (:tokens state))) :state/malformed
+      (not= (:abi state) abi-expected)         :state/abi-mismatch
+      (not= 0 (:seq-id state))                 :seq/unsupported
+      (not= (:token-hash state) (digest-seq (map int (:tokens state))))
+      :state/token-hash-mismatch
+      (not= (:state-hash state) (digest-array (::blob state) 4096))
+      :state/blob-hash-mismatch
+      (not= (:state-bytes state) (alength ^bytes (::blob state)))
+      :state/blob-size-mismatch
+      (not= (:model-content-id state) (:content-id model))
+      :state/model-mismatch
+      :else nil)))
+
+(defn- load-state-unchecked!
+  "Restore native state having ALREADY established compatibility and token
+  identity. Private, and named so that reading a call site makes the omission
+  obvious. Nothing outside this namespace should be able to skip the checks."
+  [session state seq-id]
+  (let [p (session-ptr session)
+        blob ^bytes (::blob state)]
+    (ffi/with-alloc [buf (alength blob)]
+      (ffi/write-array buf blob)
+      (ffi/with-out [np :size_t]
+        (check! (c-state-load p (int seq-id) buf (alength blob)
+                              (int (:n-tokens state)) np)
+                :state-load {})
+        (reset! (:tokens session) (:tokens state))
+        {:n-read (ffi/read np :size_t)
+         :n-tokens (:n-tokens state)}))))
+
+(defn load-state!
+  "Restore exact native state for the token vector you are about to work with.
+
+  `tokens` is REQUIRED. It is the canonical token vector of the full prompt the
+  restored state is a prefix of, and the restore is refused unless the saved
+  state is a genuine token-for-token prefix of it.
+
+  It is required because it is the entire point. When it was optional, the
+  shortest call -- (load-state! session state) -- was also the one that skipped
+  the defining safety invariant, so the easiest thing to write was the unsafe
+  thing. A stable TEXT prefix is not a stable TOKEN prefix; BPE merges across
+  the boundary and moves the final stable token, which this library measured at
+  one token on a 2793-token spine.
+
+  Refuses, before any native call, with a keyword under :jolt.llama/error:
+
+    :state/prefix-mismatch      the saved tokens do not prefix `tokens`
+    :state/model-mismatch       saved against a different model artifact
+    :state/abi-mismatch         saved by a different shim ABI
+    :state/token-hash-mismatch  the descriptor's tokens were altered
+    :state/blob-hash-mismatch   the descriptor's blob was altered
+    :state/blob-size-mismatch   the descriptor disagrees with its own blob
+    :state/malformed            not a state descriptor
+    :seq/unsupported            v0 is single-sequence
+
+  There is no public unchecked path. If you have genuinely proven identity
+  another way, prove it to this function by passing the tokens."
+  ([session state tokens] (load-state! session state tokens {}))
+  ([session state tokens {:keys [seq-id] :or {seq-id 0}}]
+   (session-ptr session)
+   (when (not= 0 seq-id)
+     (throw (ex-info "jolt.llama/load-state!: v0 is single-sequence; :seq-id must be 0"
+                     {:jolt.llama/op :state-load
+                      :jolt.llama/error :seq/unsupported
+                      :jolt.llama/seq-id seq-id})))
+   (when-not (sequential? tokens)
+     (throw (ex-info "jolt.llama/load-state!: tokens must be the canonical token vector"
+                     {:jolt.llama/op :state-load
+                      :jolt.llama/error :error/invalid-arg})))
+   (when-let [why (state-compatible? session state)]
+     (throw (ex-info (str "jolt.llama/load-state!: incompatible state (" (name why) ")")
+                     {:jolt.llama/op :state-load
+                      :jolt.llama/error why
+                      :jolt.llama/state-model (:model-content-id state)
+                      :jolt.llama/session-model (get-in session [:model :content-id])
+                      :jolt.llama/state-abi (:abi state)})))
+   (when-not (token-prefix-ok? state tokens)
+     (let [sv (:tokens state)
+           idx (or (first (keep-indexed (fn [i [a b]] (when (not= a b) i))
+                                        (map vector sv tokens)))
+                   (count tokens))]
+       (throw (ex-info "jolt.llama/load-state!: incoming tokens do not extend the saved state"
+                       {:jolt.llama/op :state-load
+                        :jolt.llama/error :state/prefix-mismatch
+                        :jolt.llama/saved-n (count sv)
+                        :jolt.llama/incoming-n (count tokens)
+                        :jolt.llama/diverges-at idx}))))
+   (load-state-unchecked! session state seq-id)))
 
 ;; -------------------------------------------------------- candidate scoring
 
@@ -642,7 +817,7 @@
                   lps (if (= 1 (count toks))
                         [(get base-lp (first toks))]
                         (do
-                          (load-state! session state {:seq-id seq-id})
+                          (load-state! session state (:tokens state) {:seq-id seq-id})
                           (loop [i 1
                                  acc [(get base-lp (first toks))]]
                             (if (>= i (count toks))
@@ -666,7 +841,7 @@
      ;; Leave the session as we found it. Only needed if a multi-token candidate
      ;; advanced the sequence.
      (when (and multi? state)
-       (load-state! session state {:seq-id seq-id}))
+       (load-state! session state (:tokens state) {:seq-id seq-id}))
      (swap! (:tokens session) (fn [_] base-tokens))
      {:candidates ranked
       :best (first ranked)
@@ -682,19 +857,45 @@
 ;; ------------------------------------------------------------------- close
 
 (defn close!
-  "Close a session or model. Idempotent: closing twice is a no-op, not an error,
-  because a resource-cleanup path that throws on a double close makes correct
-  unwinding harder than it needs to be."
+  "Close a session or model.
+
+  Idempotent for a handle this wrapper owns: closing twice returns
+  :already-closed rather than throwing, because a cleanup path that throws on a
+  double close makes correct unwinding harder than it needs to be. That
+  idempotence lives HERE and cannot be pushed into C -- once jl_session_close
+  has freed the struct, a second raw call reads freed memory before it can
+  check anything.
+
+  Closing a model with live sessions THROWS :model/sessions-active. The
+  sessions are not closed on the caller's behalf: a handle this function did
+  not create is not its to invalidate, and silently closing children would turn
+  one caller's mistake into another caller's dangling handle. The shim refuses
+  independently with JL_ERR_SESSIONS_ACTIVE."
   [handle]
   (cond
     (not (map? handle)) (throw (ex-info "jolt.llama/close!: not a handle" {:got handle}))
     @(:closed handle) :already-closed
     :else
     (let [k (::kind handle)]
-      (reset! (:closed handle) true)
       (case k
-        :session (check! (c-session-close (::ptr handle)) :session-close {})
-        :model   (check! (c-model-close (::ptr handle)) :model-close {})
+        :session
+        (do (reset! (:closed handle) true)
+            (check! (c-session-close (::ptr handle)) :session-close {})
+            (when-let [live (:sessions (:model handle))] (swap! live dec)))
+
+        :model
+        (let [live (if-let [a (:sessions handle)] @a 0)]
+          (when (pos? live)
+            ;; checked BEFORE marking closed, so a refused close leaves the
+            ;; model exactly as usable as it was
+            (throw (ex-info (str "jolt.llama/close!: " live " session(s) still open; "
+                                 "close them before the model")
+                            {:jolt.llama/op :model-close
+                             :jolt.llama/error :model/sessions-active
+                             :jolt.llama/sessions live})))
+          (reset! (:closed handle) true)
+          (check! (c-model-close (::ptr handle)) :model-close {}))
+
         (throw (ex-info "jolt.llama/close!: unknown handle kind" {:kind k})))
       :closed)))
 

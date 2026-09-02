@@ -52,11 +52,24 @@ struct jl_model {
     struct llama_model       *model;
     const struct llama_vocab *vocab;
     char                     *path;
+    /*
+     * Sessions created from this model and not yet closed. jl_model_close
+     * refuses while this is nonzero, because a jl_session holds this pointer
+     * AND a llama_context built from model->model: freeing either underneath a
+     * live session is a use-after-free the caller has no way to detect.
+     */
+    int                       active_sessions;
 };
 
 struct jl_session {
     struct llama_context *ctx;
     jl_model             *model;
+    /*
+     * Tokens resident in sequence 0, maintained here rather than trusted from
+     * the caller. It is the only legal pos0 for jl_eval, which makes evaluation
+     * append-only; see JL_ERR_NOT_APPEND.
+     */
+    int32_t               n_resident;
     /*
      * Whether the most recent jl_eval produced logits. Asking for logits before
      * any eval is a caller error we can report precisely instead of handing
@@ -145,14 +158,26 @@ jl_status jl_model_open(const char *path, const jl_model_params *params, jl_mode
 jl_status jl_model_close(jl_model *model) {
     jl_clear_error();
     if (!model) { jl_set_error("jl_model_close: null model"); return JL_ERR_INVALID_ARG; }
+    if (model->active_sessions > 0) {
+        jl_set_error("jl_model_close: %d session(s) still open; close them first",
+                     model->active_sessions);
+        return JL_ERR_SESSIONS_ACTIVE;
+    }
     if (model->model) llama_model_free(model->model);
     free(model->path);
-    /* Poison so a double close is a clean JL_ERR_INVALID_ARG next time the
-     * caller looks at fields, rather than a use-after-free. */
     model->model = NULL;
     model->vocab = NULL;
     model->path  = NULL;
     free(model);
+    /*
+     * NOTE, corrected: the fields are cleared before the free purely to make a
+     * debugger's view unambiguous. They do NOT make a second raw jl_model_close
+     * safe. After free(model) the struct is gone, so a second call READS FREED
+     * MEMORY before it can check anything -- the earlier comment here claimed
+     * the opposite and was wrong. Idempotent close is provided by the Jolt
+     * wrapper, which drops its pointer and never calls in twice; there is no
+     * way to make it safe at this layer without an out-of-band handle table.
+     */
     return JL_OK;
 }
 
@@ -201,11 +226,22 @@ jl_status jl_session_new(jl_model *model, const jl_session_params *params, jl_se
     jl_session_params p;
     if (params) p = *params; else jl_session_params_default(&p);
 
+    /*
+     * v0 is single-sequence. Rejected here rather than clamped: a caller that
+     * asked for 4 sequences and silently got 1 would build on an assumption the
+     * token-identity contract cannot support.
+     */
+    if (p.n_seq_max > 1) {
+        jl_set_error("jl_session_new: n_seq_max %u unsupported; v0 is single-sequence",
+                     p.n_seq_max);
+        return JL_ERR_SEQ_UNSUPPORTED;
+    }
+
     struct llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = p.n_ctx;
     cp.n_batch         = p.n_batch;
     cp.n_ubatch        = p.n_ubatch;
-    cp.n_seq_max       = p.n_seq_max ? p.n_seq_max : 1;
+    cp.n_seq_max       = 1;
     cp.n_threads       = p.n_threads;
     cp.n_threads_batch = p.n_threads_batch;
 
@@ -217,18 +253,37 @@ jl_status jl_session_new(jl_model *model, const jl_session_params *params, jl_se
     s->ctx = ctx;
     s->model = model;
     s->have_logits = 0;
+    s->n_resident = 0;
+    /* claimed only once the session is fully built, so a failed construction
+     * never leaves a count the caller can neither see nor release */
+    model->active_sessions++;
 
     *out = s;
     return JL_OK;
 }
 
+int32_t jl_session_n_resident(const jl_session *session) {
+    if (!session || !session->ctx) return -1;
+    return session->n_resident;
+}
+
 jl_status jl_session_close(jl_session *session) {
     jl_clear_error();
     if (!session) { jl_set_error("jl_session_close: null session"); return JL_ERR_INVALID_ARG; }
+    /* released exactly once: the count is dropped here, before the struct goes,
+     * and the model pointer is read only while the session still owns it */
+    if (session->model && session->model->active_sessions > 0) {
+        session->model->active_sessions--;
+    }
     if (session->ctx) llama_free(session->ctx);
     session->ctx = NULL;
     session->model = NULL;
+    session->n_resident = 0;
     free(session);
+    /*
+     * Same correction as jl_model_close: after free(session) a second raw call
+     * reads freed memory. Idempotence lives in the Jolt wrapper, not here.
+     */
     return JL_OK;
 }
 
@@ -247,6 +302,8 @@ jl_status jl_session_clear(jl_session *session, int32_t seq_id) {
         llama_memory_seq_rm(mem, seq_id, -1, -1);
     }
     session->have_logits = 0;
+    /* nothing resident means the next eval must start at 0 */
+    session->n_resident = 0;
     return JL_OK;
 }
 
@@ -309,7 +366,22 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
     jl_clear_error();
     if (!session || !session->ctx || !tokens) { jl_set_error("jl_eval: null session or tokens"); return JL_ERR_INVALID_ARG; }
     if (n_tokens == 0) { jl_set_error("jl_eval: n_tokens == 0"); return JL_ERR_INVALID_ARG; }
-    if (seq_id < 0) { jl_set_error("jl_eval: seq_id must be >= 0"); return JL_ERR_INVALID_ARG; }
+    if (seq_id != 0) {
+        jl_set_error("jl_eval: seq_id %d unsupported; v0 is single-sequence (seq 0)", seq_id);
+        return JL_ERR_SEQ_UNSUPPORTED;
+    }
+    /*
+     * Append-only. pos0 must be exactly what is already resident: earlier would
+     * overwrite state this shim does not truncate, later would leave a hole.
+     * Either way the session's native state and the caller's token vector would
+     * stop describing the same sequence, which is precisely the confusion the
+     * token-identity contract exists to prevent.
+     */
+    if (pos0 != session->n_resident) {
+        jl_set_error("jl_eval: pos0 %d but %d tokens are resident; evaluation is append-only",
+                     pos0, session->n_resident);
+        return JL_ERR_NOT_APPEND;
+    }
 
     const uint32_t n_ctx = llama_n_ctx(session->ctx);
     if ((size_t) pos0 + n_tokens > (size_t) n_ctx) {
@@ -372,6 +444,7 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
     }
 
     session->have_logits = 1;
+    session->n_resident += (int32_t) n_tokens;
     return JL_OK;
 }
 
@@ -489,9 +562,18 @@ jl_status jl_state_save(jl_session *session, int32_t seq_id,
 }
 
 jl_status jl_state_load(jl_session *session, int32_t seq_id,
-                        const uint8_t *buf, size_t len, size_t *n_read) {
+                        const uint8_t *buf, size_t len,
+                        int32_t n_tokens, size_t *n_read) {
     jl_clear_error();
     if (!session || !session->ctx || !buf || !n_read) { jl_set_error("jl_state_load: null arg"); return JL_ERR_INVALID_ARG; }
+    if (seq_id != 0) {
+        jl_set_error("jl_state_load: seq_id %d unsupported; v0 is single-sequence", seq_id);
+        return JL_ERR_SEQ_UNSUPPORTED;
+    }
+    if (n_tokens < 0) {
+        jl_set_error("jl_state_load: n_tokens %d is negative", n_tokens);
+        return JL_ERR_INVALID_ARG;
+    }
     size_t got = llama_state_seq_set_data(session->ctx, buf, len, (llama_seq_id) seq_id);
     if (got == 0) { jl_set_error("llama_state_seq_set_data rejected %zu bytes", len); return JL_ERR_STATE; }
     *n_read = got;
@@ -501,5 +583,12 @@ jl_status jl_state_load(jl_session *session, int32_t seq_id,
      * logits and believing they belong to the restored state.
      */
     session->have_logits = 0;
+    /*
+     * The ledger now describes the restored sequence, so the next jl_eval must
+     * append at n_tokens. Taken from the caller because the blob does not carry
+     * it; the Jolt layer has already checked the token vector this state was
+     * saved against, so the number is not a guess.
+     */
+    session->n_resident = n_tokens;
     return JL_OK;
 }

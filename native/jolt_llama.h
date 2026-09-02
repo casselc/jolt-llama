@@ -39,7 +39,14 @@ extern "C" {
  * Bumped whenever the meaning or layout of anything below changes. Jolt checks
  * this at load time so a stale .so fails loudly instead of misreading memory.
  */
-#define JL_ABI_VERSION 1
+/*
+ * 2: jl_model_close now REFUSES while sessions are open (was: freed the model
+ *    underneath them); jl_eval is append-only and rejects seq_id != 0;
+ *    jl_state_load takes the token count the state represents. A v1 caller
+ *    linked against v2 would silently pass its n_read pointer as n_tokens, so
+ *    this is a hard version bump and Jolt checks it.
+ */
+#define JL_ABI_VERSION 2
 
 int32_t     jl_abi_version(void);
 const char *jl_llama_build(void);   /* llama.cpp build/version string */
@@ -57,7 +64,34 @@ typedef enum {
     JL_ERR_DECODE         = -7,
     JL_ERR_STATE          = -8,
     JL_ERR_BUFFER_TOO_SMALL = -9,
-    JL_ERR_NO_LOGITS      = -10
+    JL_ERR_NO_LOGITS      = -10,
+    /*
+     * jl_model_close was called while sessions created from that model are
+     * still open. Refused rather than honoured: a jl_session holds both its
+     * jl_model* and a llama_context built from that model's llama_model, so
+     * freeing the model underneath a live session is a use-after-free the
+     * caller cannot detect. The caller closes its sessions first; this library
+     * will NOT close them on the caller's behalf, because a handle it did not
+     * create is not its to invalidate.
+     */
+    JL_ERR_SESSIONS_ACTIVE = -11,
+    /*
+     * v0 is deliberately single-sequence: n_seq_max must be 1 and every seq_id
+     * must be 0. The Jolt layer keeps ONE token ledger per session, so a second
+     * native sequence would have no distinct token identity to check a restore
+     * against -- and the token-identity contract is the point of this library.
+     * Multi-sequence support needs a per-sequence identity design and its own
+     * validation, not a relaxed bound here.
+     */
+    JL_ERR_SEQ_UNSUPPORTED = -12,
+    /*
+     * jl_eval was asked to write at a position other than the end of what the
+     * session has already evaluated. v0 evaluation is append-only: the native
+     * recurrent/KV state is not truncated to an arbitrary position, so writing
+     * into the middle would leave the session's state and its token ledger
+     * describing different things.
+     */
+    JL_ERR_NOT_APPEND     = -13
 } jl_status;
 
 /*
@@ -150,8 +184,18 @@ jl_status jl_token_to_piece(const jl_model *model, int32_t token,
  * produced for the final token only, which is what candidate scoring needs and
  * keeps the output buffer small.
  */
+/*
+ * APPEND-ONLY: pos0 must equal the session's resident token count, which
+ * jl_session_n_resident reports. Evaluating into an earlier position, or past
+ * the end, is JL_ERR_NOT_APPEND. The native recurrent/KV state is not truncated
+ * to an arbitrary position, so allowing either would leave the state and the
+ * caller's token ledger describing different sequences.
+ */
 jl_status jl_eval(jl_session *session, int32_t seq_id,
                   const int32_t *tokens, size_t n_tokens, int32_t pos0);
+
+/* Tokens currently resident in the session, i.e. the only legal pos0. */
+int32_t jl_session_n_resident(const jl_session *session);
 
 /* --------------------------------------------------------------- logits */
 
@@ -181,8 +225,14 @@ jl_status jl_token_logprob(jl_session *session, int32_t token, float *out);
 jl_status jl_state_size(jl_session *session, int32_t seq_id, size_t *out);
 jl_status jl_state_save(jl_session *session, int32_t seq_id,
                         uint8_t *buf, size_t cap, size_t *n_out);
+/*
+ * `n_tokens` is how many tokens the blob represents. The shim cannot derive it
+ * from the blob and needs it to restore its resident count, without which the
+ * next jl_eval could not tell an append from an overwrite.
+ */
 jl_status jl_state_load(jl_session *session, int32_t seq_id,
-                        const uint8_t *buf, size_t len, size_t *n_read);
+                        const uint8_t *buf, size_t len,
+                        int32_t n_tokens, size_t *n_read);
 
 #ifdef __cplusplus
 }
