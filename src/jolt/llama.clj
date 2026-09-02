@@ -351,12 +351,22 @@
         (let [ptr (read-ptr pp)]
           (swap! (:sessions model) inc)
           {::kind :session
+           ;; identifies THIS session instance, so a checkpoint cannot be
+           ;; mistaken for one taken from another session over the same model
+           :session-id (str (random-uuid))
            ::ptr ptr
            :model model
            :n-ctx (c-session-n-ctx ptr)
            ;; The token vector currently resident in seq 0. This is the Jolt-side
            ;; half of the token-identity contract; the C layer has no opinion.
            :tokens (atom [])
+           ;; MONOTONIC EVALUATION REVISION. Bumped by every operation that
+           ;; moves native state. Token equality is not NUMERICAL equality --
+           ;; the same token vector reached by a different call structure
+           ;; produces different logits below the calibrated append threshold --
+           ;; so a candidate-rewind checkpoint has to name the exact evaluation
+           ;; it was taken from, not merely the tokens it contains.
+           :revision (atom 0)
            :state (atom :open)})))))
 
 (defn- session-ptr [s]
@@ -377,6 +387,7 @@
   (let [p (session-ptr session)]
     (check! (c-session-clear p 0) :session-clear {})
     (reset! (:tokens session) [])
+    (swap! (:revision session) inc)
     :ok))
 
 ;; ----------------------------------------------------------------- tokenize
@@ -458,6 +469,7 @@
        (check! (c-eval p (int seq-id) buf n (int pos0)) :eval
                {:jolt.llama/n-tokens n :jolt.llama/pos pos0}))
      (swap! (:tokens session) into toks)
+     (swap! (:revision session) inc)
      {:n-tokens n :pos pos0 :n-resident (count @(:tokens session))})))
 
 ;; ------------------------------------------------------------------- logits
@@ -599,6 +611,12 @@
               ;; the NATIVE RUNTIME that produced this blob. The model and the
               ;; ABI together do not identify it: two llama.cpp builds behind
               ;; one shim ABI serialize different bytes.
+              ;; WHICH EVALUATION this state was taken from. Two states with
+              ;; identical tokens can represent different numerical bases, so a
+              ;; checkpoint used for candidate rewind must match the session
+              ;; and revision it claims to be a checkpoint OF.
+              :session-id (:session-id session)
+              :revision @(:revision session)
               :runtime-id (runtime-build-id)
               :model-content-id (get-in session [:model :content-id])
               :model-desc (get-in session [:model :desc])
@@ -679,6 +697,16 @@
                               (int (:n-tokens state)) np)
                 :state-load {})
         (reset! (:tokens session) (:tokens state))
+        ;; Restoring THIS session's own checkpoint returns it to that
+        ;; checkpoint's numerical identity, so the revision goes back rather
+        ;; than forward -- otherwise a legitimate rewind would look like a new
+        ;; evaluation and the candidate-rewind round trip could never close.
+        ;; A checkpoint from ANOTHER session leaves this one at a new, unnamed
+        ;; revision: the bytes may load, but this session is not that session
+        ;; and must not start claiming to be.
+        (if (= (:session-id state) (:session-id session))
+          (reset! (:revision session) (:revision state))
+          (swap! (:revision session) inc))
         {:n-read (ffi/read np :size_t)
          :n-tokens (:n-tokens state)}))))
 
@@ -885,16 +913,20 @@
   state and no rewind, touches neither native state nor the token ledger, and
   is exactly comparable under the validated exactness contract.
 
-  The MULTI-TOKEN path is EXPERIMENTAL and is not covered by the v0 promotion
-  guarantee. It is correct on token identity -- the rewind state must be the
-  exact base token vector -- but token equality is not NUMERICAL equality. This
-  repository's own measurements show that the same token vector reached by a
-  different call structure produces different logits below the calibrated
-  append threshold, so a state saved from one structure can satisfy the token
-  check while representing a different numerical base than the logits the first
-  token was read from. Closing that needs the API to capture its own checkpoint,
-  or a session/revision identity on the descriptor. Until then, do not build on
-  multi-token scoring as if it carried the same proof as the single-token path.
+  The MULTI-TOKEN path remains EXPERIMENTAL, but the numerical-base hole is now
+  closed. A rewind checkpoint must name THIS session and THIS evaluation
+  revision, not merely carry matching tokens -- because token equality is not
+  numerical equality: the same token vector reached by a different call
+  structure produces different logits below the calibrated append threshold.
+  Property C5 constructs exactly that case and asserts the refusal.
+  :base-logprobs is likewise a descriptor bound to its origin rather than a
+  bare map that could carry scores from another base.
+
+  It stays experimental because failure ATOMICITY is unresolved: an exception
+  partway through candidate scoring can skip the final restore, leaving the
+  session advanced past its base. Until that is either restored reliably or
+  surfaced as an explicit poisoned state, do not build on multi-token scoring
+  as if it carried the same proof as the single-token path.
 
   The caller must already have evaluated the base context (spine, or spine plus
   delta) so logits are available. Each candidate is {:id any :tokens [ids...]}.
@@ -978,18 +1010,37 @@
          ;;
          ;; Checked BEFORE any candidate touches native state, so a refusal
          ;; leaves the session exactly as it was found.
-         _ (when (and multi? (not= (vec (:tokens state)) (vec base-tokens)))
-             (throw (ex-info (str "jolt.llama/score-candidates: :state is not the current "
-                                  "scoring base; candidate rewind needs the exact base")
-                             {:jolt.llama/op :score-candidates
-                              :jolt.llama/error :score/base-state-mismatch
-                              :jolt.llama/base-n base-n
-                              :jolt.llama/state-n (count (:tokens state))
-                              :jolt.llama/diverges-at
-                              (or (first (keep-indexed
-                                          (fn [i [a b]] (when (not= a b) i))
-                                          (map vector (:tokens state) base-tokens)))
-                                  (min (count (:tokens state)) base-n))})))
+         ;; TOKEN EQUALITY IS NOT NUMERICAL EQUALITY. This library's own
+         ;; measurements show the same token vector reached by a different call
+         ;; structure produces different logits below the calibrated append
+         ;; threshold, so a state carrying the right tokens can still represent
+         ;; a different numerical base than the logits the first token is read
+         ;; from -- composing P(t1 | A) with P(t2 | B, t1), which is the same
+         ;; defect as before one level down.
+         ;;
+         ;; The checkpoint must therefore be THIS session at THIS evaluation
+         ;; revision, not merely a state with matching tokens. Ordinary
+         ;; load-state! portability between two handles over the same artifact
+         ;; is deliberately NOT tightened; the stricter identity applies only to
+         ;; a checkpoint claiming to represent the current logits.
+         _ (when multi?
+             (let [why (cond
+                         (not= (:session-id state) (:session-id session))
+                         :score/base-session-mismatch
+                         (not= (:revision state) @(:revision session))
+                         :score/base-revision-mismatch
+                         (not= (vec (:tokens state)) (vec base-tokens))
+                         :score/base-state-mismatch
+                         :else nil)]
+               (when why
+                 (throw (ex-info (str "jolt.llama/score-candidates: :state is not this "
+                                      "session's current scoring base (" (name why) ")")
+                                 {:jolt.llama/op :score-candidates
+                                  :jolt.llama/error why
+                                  :jolt.llama/base-n base-n
+                                  :jolt.llama/state-n (count (:tokens state))
+                                  :jolt.llama/state-revision (:revision state)
+                                  :jolt.llama/session-revision @(:revision session)})))))
          ;; One read of the base distribution serves every candidate's first
          ;; token. Doing this before any restore is what keeps the single-token
          ;; path free of evaluation.
@@ -1001,8 +1052,30 @@
          ;; Rather than re-evaluate -- which would land on a different kernel
          ;; path and silently change the scoring convention -- the base
          ;; log-probabilities are returned, and accepted back here.
-         base-lp (if (and base-logprobs (every? base-logprobs first-tokens))
-                   (select-keys base-logprobs first-tokens)
+         ;; :base-logprobs is a DESCRIPTOR, not a bare token->score map. A bare
+         ;; map can silently come from another prompt, session or evaluation,
+         ;; giving first-token scores from one base and continuations from
+         ;; another. It is accepted only when it names the same session and
+         ;; revision it is being replayed into.
+         _ (when base-logprobs
+             (let [why (cond
+                         (not (map? (:scores base-logprobs))) :score/base-logprobs-malformed
+                         (not= (:session-id base-logprobs) (:session-id session))
+                         :score/base-logprobs-mismatch
+                         (not= (:revision base-logprobs) @(:revision session))
+                         :score/base-logprobs-mismatch
+                         (not (every? (:scores base-logprobs) first-tokens))
+                         :score/base-logprobs-incomplete
+                         :else nil)]
+               (when why
+                 (throw (ex-info (str "jolt.llama/score-candidates: :base-logprobs does not "
+                                      "describe this scoring base (" (name why) ")")
+                                 {:jolt.llama/op :score-candidates
+                                  :jolt.llama/error why
+                                  :jolt.llama/given-revision (:revision base-logprobs)
+                                  :jolt.llama/session-revision @(:revision session)})))))
+         base-lp (if base-logprobs
+                   (select-keys (:scores base-logprobs) first-tokens)
                    (into {} (map (fn [t] [t (token-logprob session t)]) first-tokens)))
          scored
          (doall
@@ -1051,8 +1124,11 @@
       :base-n-tokens base-n
       ;; named so a caller can assert on it; see the docstring
       ;; feed this back as :base-logprobs to score the same base again after a
-      ;; restore has cleared the session's logits
-      :base-logprobs base-lp
+      ;; restore has cleared the session's logits. Bound to the session and
+      ;; revision it came from, so it cannot be replayed into a different base.
+      :base-logprobs {:session-id (:session-id session)
+                      :revision @(:revision session)
+                      :scores base-lp}
       :convention :teacher-forced/first-from-base-rest-single-token
       :homogeneous? (= 1 (count (distinct (map :n-tokens ranked))))})))
 

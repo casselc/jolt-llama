@@ -641,8 +641,15 @@
             (let [cands [{:id :a :tokens [(first toks) (second toks)]}]
                   got (try (llama/score-candidates s cands {:state sb}) :ACCEPTED
                            (catch Throwable e (:jolt.llama/error (ex-data e))))]
-              ;; PREFIX IS NOT ENOUGH: sb is individually reusable and still wrong here
-              (when-not (= :score/base-state-mismatch got)
+              ;; PREFIX IS NOT ENOUGH: sb is individually reusable as a
+              ;; checkpoint and still wrong here. Any of the base-identity
+              ;; reasons is a correct refusal -- the revision check is strictly
+              ;; stronger than the token check and fires first, so a prefix
+              ;; saved at an earlier evaluation is caught as a revision
+              ;; mismatch. What must never happen is acceptance.
+              (when-not (#{:score/base-state-mismatch
+                           :score/base-revision-mismatch
+                           :score/base-session-mismatch} got)
                 (throw (ex-info "a non-base state was accepted for candidate rewind"
                                 {:hegel/origin "score/base-must-be-exact" :got got})))
               ;; and the refusal happened before anything moved
@@ -922,6 +929,102 @@
                                  :n @(:sessions m2)}))))
             (finally (try (llama/close! m2) (catch Throwable _ nil))))))))))
 
+
+(defn check-same-tokens-different-numerical-base-refused! [runner]
+  (report/run!
+   runner
+   "C5: identical tokens reached by a different call structure are still refused"
+   (fn []
+     (h/run-test!
+      {:test-cases 8 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; THE case token equality cannot catch. Build the SAME token vector two
+        ;; ways -- one pass, and a split with a short suffix -- which this
+        ;; repository has measured to produce DIFFERENT logits below the
+        ;; calibrated threshold. Save from one, sit at the other. The tokens
+        ;; match exactly, so the old check passed and the score would have
+        ;; composed P(t1 | A) with P(t2 | B, t1).
+        (let [s state-session
+              toks (vec (tok (probe-text 6)))
+              cut (- (count toks) 8)]          ; short suffix: below the threshold
+          ;; base A: split evaluation
+          (llama/clear! s)
+          (llama/eval! s (vec (take cut toks)))
+          (llama/eval! s (vec (drop cut toks)))
+          (let [st-split (llama/save-state s)]
+            ;; now sit at base B: the same tokens, one pass
+            (llama/clear! s)
+            (llama/eval! s toks)
+            (when-not (= (vec (:tokens st-split)) @(:tokens s))
+              (throw (ex-info "the two arms did not produce the same token vector"
+                              {:hegel/origin "c5/same-tokens"})))
+            (let [top (llama/top-k s 2 {:pieces? false})
+                  cands [{:id :multi :tokens [(:token (first top)) (:token (second top))]}]
+                  got (try (llama/score-candidates s cands {:state st-split}) :ACCEPTED
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+              ;; tokens are identical, so ONLY the revision identity can refuse it
+              (when-not (= :score/base-revision-mismatch got)
+                (throw (ex-info "a numerically different base with identical tokens was accepted"
+                                {:hegel/origin "c5/revision-refuses" :got got})))))))))))
+
+(defn check-stale-base-logprobs-refused! [runner]
+  (report/run!
+   runner
+   "C6: base scores captured at another base are refused, not merely reused"
+   (fn []
+     (h/run-test!
+      {:test-cases 8 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; A bare token->score map cannot say which base it came from, so it
+        ;; could supply first-token scores from one evaluation while the
+        ;; continuations came from another. The descriptor names its origin.
+        (let [s state-session
+              a (vec (tok (probe-text 3)))
+              b (vec (tok (probe-text 5)))]
+          (llama/clear! s)
+          (llama/eval! s a)
+          (let [top (llama/top-k s 3 {:pieces? false})
+                cands (mapv (fn [t] {:id (:token t) :tokens [(:token t)]}) top)
+                at-a (llama/score-candidates s cands)
+                blp (:base-logprobs at-a)]
+            ;; move to a different base
+            (llama/clear! s)
+            (llama/eval! s b)
+            (let [top-b (llama/top-k s 3 {:pieces? false})
+                  cands-b (mapv (fn [t] {:id (:token t) :tokens [(:token t)]}) top-b)
+                  got (try (llama/score-candidates s cands-b {:base-logprobs blp}) :ACCEPTED
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+              (when-not (= :score/base-logprobs-mismatch got)
+                (throw (ex-info "stale base scores were accepted at a different base"
+                                {:hegel/origin "c6/stale-refused" :got got})))))))))))
+
+(defn check-base-logprobs-round-trip! [runner]
+  (report/run!
+   runner
+   "base scores replayed into the SAME base are accepted"
+   (fn []
+     (h/run-test!
+      {:test-cases 6 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; The safety check must not break the documented workflow: after
+        ;; multi-token scoring leaves the session restored and logit-less, the
+        ;; returned descriptor is how the same base is scored again.
+        (let [s state-session
+              toks (vec (tok (probe-text 3)))]
+          (llama/clear! s)
+          (llama/eval! s toks)
+          (let [st (llama/save-state s)
+                top (llama/top-k s 2 {:pieces? false})
+                cands [{:id :one :tokens [(:token (first top))]}
+                       {:id :two :tokens [(:token (first top)) (:token (second top))]}]
+                r1 (llama/score-candidates s cands {:state st})
+                ;; the session is now restored to the base and has no logits
+                r2 (llama/score-candidates s cands {:state st
+                                                    :base-logprobs (:base-logprobs r1)})]
+            (when-not (= (map :id (:candidates r1)) (map :id (:candidates r2)))
+              (throw (ex-info "a replayed base produced a different ranking"
+                              {:hegel/origin "c6/round-trip"}))))))))))
+
 ;; ----------------------------------------------------------------- main
 
 (defn -main [& _]
@@ -946,6 +1049,9 @@
 
     (println "--- candidate base state ---")
     (check-scoring-base-must-be-exact! runner)
+    (check-same-tokens-different-numerical-base-refused! runner)
+    (check-stale-base-logprobs-refused! runner)
+    (check-base-logprobs-round-trip! runner)
     (check-single-token-path-is-state-free! runner)
     (check-scoring-leaves-the-session-untouched! runner)
 
