@@ -334,6 +334,27 @@ description was not an identity at all.
     model        qwen3.5-0.8b-q4_0.gguf
                  sha256 57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf
 
+## Samizdat canary regression
+
+The embedded-controller canary was validated against jolt-llama
+`6ec88472bc63371ac9b70729ffbd58e35f35ce8d` on the experimental llama.cpp build.
+That evidence is not rewritten. Re-run against the hardened coordinate and the
+clean llama.cpp build, the results are **byte-identical**:
+
+    situation "healthy":      hold -1.08148  margin 1.68001  decision act
+    situation "api degraded": hold -1.03207  margin 1.58262  decision act
+
+    ranking CHANGED with state: false
+    journal round trip: read back from SQLite, decision "act", no machine state
+
+Same legal-domain behaviour, same selected action, same scores to five
+decimals, same journal/provenance, no lifecycle problem. Identical across BOTH
+a jolt-llama hardening and a llama.cpp build change, which is a stronger
+statement than either alone.
+
+Run through a temporary local-path override; the canary's own pin was left at
+the reviewed SHA and the override was reverted.
+
 ## Deferred
 
 * **Aspect join points (§12).** Not attempted in this pass. They are P1 behind
