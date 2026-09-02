@@ -169,17 +169,53 @@
                        :jolt.llama/abi-found got
                        :jolt.llama/abi-expected abi-expected})))))
 
-(defonce ^:private runtime-started (atom false))
+;; Process-wide native runtime lifecycle:
+;;
+;;     :uninitialized --CAS--> :initializing --> :initialized
+;;                                           \-> :failed
+;;
+;; The previous boolean was read-then-write, so N threads opening their first
+;; model could all observe false and all call jl_runtime_init -- and the native
+;; refcount is a plain int, so those increments race too. Only the thread
+;; winning :uninitialized -> :initializing calls in; the rest wait and observe
+;; the same outcome. defonce takes no docstring in Jolt, hence the comment.
+(defonce ^:private runtime-state (atom :uninitialized))
 
 (defn init-runtime!
-  "Idempotent. The native side refcounts, but repeating it from Jolt would leak
-  a reference per call, so the first success latches."
+  "Initialise the native runtime exactly once per process.
+
+  Idempotent and safe to call concurrently. The native side refcounts, but
+  repeating it from Jolt would leak a reference per call AND the native
+  refcount is a plain int with no atomicity of its own -- so this admits
+  exactly one caller rather than relying on the C side to survive a race.
+
+  Every waiter observes the same outcome: a failed initialisation is latched as
+  :failed and re-thrown for all of them, rather than letting the loser of the
+  race proceed as if the runtime were up.
+
+  The runtime is never freed. It is not part of ordinary handle lifecycle, and
+  that is the v0 contract."
   []
-  (when-not @runtime-started
-    (ensure-abi!)
-    (check! (c-runtime-init) :runtime-init {})
-    (reset! runtime-started true))
-  :ok)
+  (loop []
+    (case @runtime-state
+      :initialized :ok
+      :failed (throw (ex-info "jolt.llama: native runtime failed to initialise"
+                              {:jolt.llama/op :runtime-init
+                               :jolt.llama/error :runtime/init-failed}))
+      :initializing (do (Thread/sleep 1) (recur))
+      :uninitialized
+      (if (compare-and-set! runtime-state :uninitialized :initializing)
+        (try
+          (ensure-abi!)
+          (check! (c-runtime-init) :runtime-init {})
+          (reset! runtime-state :initialized)
+          :ok
+          (catch Throwable e
+            ;; latch the failure so every waiter sees it rather than spinning
+            (reset! runtime-state :failed)
+            (throw e)))
+        ;; lost the race; fall through and observe the winner's outcome
+        (recur)))))
 
 ;; -------------------------------------------------------------------- model
 
@@ -499,25 +535,39 @@
     (format "%08x" (bit-and h 0xffffffff))))
 
 (defn- sentinel-array
-  "The same sentinel over the first `n` bytes of an array, WITHOUT seqing it.
+  "A cheap stable CHECK value over an array, WITHOUT seqing it. NOT a hash.
 
-  SAMPLED, and therefore weaker still: it reads a bounded prefix, so a mutation
-  past that prefix is invisible to it. Paired with the exact byte count, which
-  catches truncation and extension, it is enough to notice a descriptor that has
-  been accidentally mixed up or damaged -- and it is not enough to call a state
-  content-addressed, which is why nothing here does.
+  Samples three windows -- head, middle and tail -- and mixes the exact length
+  in. The earlier version read only a 4096-byte prefix, so a mutation anywhere
+  past it was invisible; sampling the tail costs nothing and closes the case
+  that actually happens, a blob truncated or overwritten at the far end.
 
-  `(reduce f init (take 4096 blob))` looks equivalent and is not: taking a seq
-  over a 54 MB byte array walks the whole array before `take` sees its first
-  element. That one expression cost 7.4 of the 7.6 seconds save-state spent, and
-  made state capture look 41x slower than state restore for what is the same
-  memcpy in both directions. Index the array instead."
-  [arr n]
-  (let [limit (min (int n) (alength arr))]
-    (loop [i 0 h (int 17)]
-      (if (>= i limit)
-        (format "%08x" (bit-and h 0xffffffff))
-        (recur (inc i) (unchecked-int (+ (* 31 h) (bit-and (aget arr i) 0xff))))))))
+  Still a SENTINEL and not a content identity. It detects accidental corruption
+  and descriptor mix-ups. It would not survive an adversary, and a mutation
+  that misses all three windows and preserves the length is undetected. Nothing
+  here calls it content-addressed.
+
+  A real SHA-256 is not available: java.security.MessageDigest lives in
+  io.github.jolt-lang/jolt-crypto, not Jolt core, and this library's central
+  property is a top-level :deps {}. Verified, not assumed --
+
+    jolt -e '(java.security.MessageDigest/getInstance \"SHA-256\")'
+    => java.security.MessageDigest is provided by the
+       io.github.jolt-lang/jolt-crypto library, not core.
+
+  When a state crosses a persistence or process boundary it needs a real
+  digest, and that is the point at which to take the dependency."
+  [arr window]
+  (let [n (alength arr)
+        w (min (int window) n)
+        starts [0 (max 0 (- (quot n 2) (quot w 2))) (max 0 (- n w))]
+        mix (fn [h off]
+              (loop [i 0 h h]
+                (if (>= i w)
+                  h
+                  (recur (inc i)
+                         (unchecked-int (+ (* 31 h) (bit-and (aget arr (+ off i)) 0xff)))))))]
+    (format "%08x" (bit-and (reduce mix (unchecked-int (+ 17 n)) starts) 0xffffffff))))
 
 (defn save-state
   "Capture exact native state for a sequence, bound to its token vector.
@@ -1002,6 +1052,7 @@
   The handle carries :state, moved only by compare-and-set!:
 
       :open --CAS--> :closing --> :closed
+                              or  :close-failed   (native close threw)
 
   Only the thread that wins :open -> :closing calls native free. Every other
   caller observes :closing or :closed and returns :already-closed without
@@ -1012,6 +1063,10 @@
   This is idempotence that CANNOT live in C. Once jl_session_close has freed the
   struct a second raw call reads freed memory before it can check anything, so
   the guard has to sit above the pointer -- which is what this atom is.
+
+  A native close that throws leaves the handle at :close-failed, which is
+  terminal and observable, rather than parked at :closing where every later
+  caller would be told :already-closed about a resource that was never freed.
 
   Closing a model with live sessions THROWS :model/sessions-active and leaves
   the model :open and fully usable. Child sessions are never closed on the
@@ -1031,12 +1086,20 @@
         :session
         (if-not (compare-and-set! st :open :closing)
           :already-closed
-          (do (check! (c-session-close (::ptr handle)) :session-close {})
-              ;; released only by the thread that actually closed, so the
-              ;; model's count can never go negative or be decremented twice
-              (when-let [live (:sessions (:model handle))] (swap! live dec))
-              (reset! st :closed)
-              :closed))
+          (try
+            (check! (c-session-close (::ptr handle)) :session-close {})
+            ;; released only by the thread that actually closed, so the model's
+            ;; count can never go negative or be decremented twice
+            (when-let [live (:sessions (:model handle))] (swap! live dec))
+            (reset! st :closed)
+            :closed
+            (catch Throwable e
+              ;; A native close that FAILED must not leave the handle parked at
+              ;; :closing, where every later caller gets :already-closed for a
+              ;; resource that was never released and the model can never close.
+              ;; :close-failed is terminal and observable.
+              (reset! st :close-failed)
+              (throw e))))
 
         :model
         ;; the live-session check happens BEFORE the CAS, so a refused close
@@ -1050,9 +1113,13 @@
                              :jolt.llama/sessions live})))
           (if-not (compare-and-set! st :open :closing)
             :already-closed
-            (do (check! (c-model-close (::ptr handle)) :model-close {})
-                (reset! st :closed)
-                :closed)))
+            (try
+              (check! (c-model-close (::ptr handle)) :model-close {})
+              (reset! st :closed)
+              :closed
+              (catch Throwable e
+                (reset! st :close-failed)
+                (throw e)))))
 
         (throw (ex-info "jolt.llama/close!: unknown handle kind" {:kind k}))))))
 

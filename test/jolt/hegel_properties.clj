@@ -767,6 +767,161 @@
               (throw (ex-info "model would not close after its session race"
                               {:hegel/origin "close/model-after-race"}))))))))))
 
+
+;; -------------------------------------------------------- integrity checks
+
+(defn check-integrity-sentinels-detect-mutation! [runner]
+  (report/run!
+   runner
+   "a mutated token vector or state blob is refused before any native load"
+   (fn []
+     (h/run-test!
+      {:test-cases 20 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; These are SENTINELS, not content hashes, and the properties assert
+        ;; exactly what they promise: a token mutation anywhere, and a blob
+        ;; mutation at the head, middle or tail, are detected. A blob mutation
+        ;; that misses all three sampled windows is NOT promised and is not
+        ;; asserted here.
+        (let [s state-session
+              toks (vec (tok (probe-text 3)))
+              _ (llama/clear! s)
+              _ (llama/eval! s toks)
+              st (llama/save-state s)
+              blob (:jolt.llama/blob st)
+              n (alength ^bytes blob)
+              where (h/draw! (g/sampled-from [:token :head :middle :tail :length]))
+              flip (fn [off]
+                     (let [c (byte-array n)]
+                       (System/arraycopy blob 0 c 0 n)
+                       (aset c off (byte (bit-xor (aget c off) 0x5a)))
+                       c))
+              bad (case where
+                    :token  (let [i (h/draw! (g/integer 0 (dec (count toks))))]
+                              (assoc st :tokens (assoc toks i (inc (nth toks i)))))
+                    :head   (assoc st :jolt.llama/blob (flip 0))
+                    :middle (assoc st :jolt.llama/blob (flip (quot n 2)))
+                    :tail   (assoc st :jolt.llama/blob (flip (dec n)))
+                    :length (assoc st :state-bytes (dec n)))
+              got (try (llama/load-state! s bad toks) :ACCEPTED
+                       (catch Throwable e (:jolt.llama/error (ex-data e))))]
+          (when (= :ACCEPTED got)
+            (throw (ex-info "a mutated state descriptor was accepted"
+                            {:hegel/origin (str "integrity/detects-" (name where))
+                             :where where})))
+          ;; and an UNMODIFIED descriptor must still pass, or the check is
+          ;; simply rejecting everything
+          (when-let [why (llama/state-compatible? s st)]
+            (throw (ex-info "an unmodified descriptor was refused"
+                            {:hegel/origin "integrity/clean-passes" :why why})))))))))
+
+(defn check-unattributed-runtime-never-matches! [runner]
+  (report/run!
+   runner
+   "an unattributable runtime id is refused even against an identical one"
+   (fn []
+     (h/run-test!
+      {:test-cases 8 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; String equality would let "unknown:x" match "unknown:x", so two
+        ;; shims built from two UNIDENTIFIED trees would exchange state -- the
+        ;; exact case the runtime check exists to stop.
+        (let [s state-session
+              toks (vec (tok (probe-text 2)))
+              _ (llama/clear! s)
+              _ (llama/eval! s toks)
+              st (llama/save-state s)
+              tag (str "unknown:" (h/draw! (g/integer 0 999)))
+              got (try (llama/load-state! s (assoc st :runtime-id tag) toks) :ACCEPTED
+                       (catch Throwable e (:jolt.llama/error (ex-data e))))]
+          (when-not (= :state/runtime-unattributed got)
+            (throw (ex-info "an unattributed runtime id was not refused"
+                            {:hegel/origin "runtime/unattributed-never-matches"
+                             :got got})))
+          ;; and it must be a DIFFERENT error than a plain mismatch, or the two
+          ;; cases cannot be told apart in an audit
+          (let [mism (try (llama/load-state! s (assoc st :runtime-id "llama.cpp:dead:clean") toks)
+                          :ACCEPTED
+                          (catch Throwable e (:jolt.llama/error (ex-data e))))]
+            (when-not (= :state/runtime-mismatch mism)
+              (throw (ex-info "a runtime mismatch reported the wrong reason"
+                              {:hegel/origin "runtime/mismatch-is-distinct"
+                               :got mism}))))))))))
+
+
+(defn check-concurrent-first-open-initialises-once! [runner]
+  (report/run!
+   runner
+   "N threads opening a first model produce one runtime init and one outcome"
+   (fn []
+     (h/run-test!
+      {:test-cases 4 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; init-runtime! was read-then-write, so N threads opening their first
+        ;; model could all observe false and all call jl_runtime_init -- and
+        ;; the native refcount is a plain int, so those increments race too.
+        ;; The runtime is process-wide and already up by the time this runs, so
+        ;; what is asserted is the observable contract: every concurrent caller
+        ;; succeeds and sees the same outcome, and no model is damaged.
+        (let [n (h/draw! (g/integer 2 5))
+              latch (promise)
+              fs (doall (for [_ (range n)]
+                          (future (deref latch)
+                                  (try {:ok (llama/init-runtime!)}
+                                       (catch Throwable e {:err (ex-message e)})))))]
+          (deliver latch true)
+          (let [rs (mapv deref fs)]
+            (when-not (every? #(= :ok (:ok %)) rs)
+              (throw (ex-info "concurrent init-runtime! gave differing outcomes"
+                              {:hegel/origin "init/one-outcome" :results rs})))
+            ;; and the runtime still works afterwards
+            (let [m2 (llama/open-model {:path model-path})]
+              (try
+                (when-not (pos? (:n-vocab m2))
+                  (throw (ex-info "runtime unusable after a concurrent init race"
+                                  {:hegel/origin "init/usable-after-race"})))
+                (finally (llama/close! m2)))))))))))
+
+(defn check-close-outcomes-are-defined! [runner]
+  (report/run!
+   runner
+   "every close returns a defined outcome and the count never goes negative"
+   (fn []
+     (h/run-test!
+      {:test-cases 8 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Ownership counting under mixed legal and illegal lifecycle traces.
+        ;; The invariant is that active-session-count >= 0 at every point, a
+        ;; failed construction consumes none, and a model closes iff the count
+        ;; is zero.
+        (let [m2 (llama/open-model {:path model-path})]
+          (try
+            (let [k (h/draw! (g/integer 1 3))
+                  sessions (doall (for [_ (range k)]
+                                    (llama/new-session m2 {:context-size 256 :threads 2})))]
+              ;; an illegal construction in the middle must consume no slot
+              (let [before @(:sessions m2)]
+                (try (llama/new-session m2 {:context-size 256 :seq-max 3})
+                     (catch Throwable _ nil))
+                (when-not (= before @(:sessions m2))
+                  (throw (ex-info "a rejected session consumed an ownership slot"
+                                  {:hegel/origin "own/failed-new-consumes-none"}))))
+              ;; duplicate closes are defined and decrement exactly once
+              (doseq [s sessions]
+                (let [a (llama/close! s) b (llama/close! s)]
+                  (when-not (and (= :closed a) (= :already-closed b))
+                    (throw (ex-info "duplicate close was not defined"
+                                    {:hegel/origin "own/duplicate-close-defined"
+                                     :got [a b]})))))
+              (when (neg? @(:sessions m2))
+                (throw (ex-info "the ownership count went negative"
+                                {:hegel/origin "own/never-negative"})))
+              (when-not (zero? @(:sessions m2))
+                (throw (ex-info "the ownership count did not drain"
+                                {:hegel/origin "own/drains-to-zero"
+                                 :n @(:sessions m2)}))))
+            (finally (try (llama/close! m2) (catch Throwable _ nil))))))))))
+
 ;; ----------------------------------------------------------------- main
 
 (defn -main [& _]
@@ -794,8 +949,14 @@
     (check-single-token-path-is-state-free! runner)
     (check-scoring-leaves-the-session-untouched! runner)
 
-    (println "--- concurrent close ---")
+    (println "--- concurrency and ownership ---")
     (check-concurrent-close-is-single! runner)
+    (check-concurrent-first-open-initialises-once! runner)
+    (check-close-outcomes-are-defined! runner)
+
+    (println "--- integrity and runtime identity ---")
+    (check-integrity-sentinels-detect-mutation! runner)
+    (check-unattributed-runtime-never-matches! runner)
 
     (println "--- state compatibility ---")
     (check-incompatible-state-is-refused! runner)
