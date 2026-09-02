@@ -1,6 +1,6 @@
 (ns jolt.probe-suffix-len
   "Why does a 1-token suffix after restore not match a full recompute exactly,
-  when M1's многotoken suffix matched at 0.00000000?
+  when M1's multi-token suffix matched at 0.00000000?
 
   Hypothesis: llama.cpp selects a different Gated Delta Net kernel by ubatch
   size. The load log for this model announces both:
