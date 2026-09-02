@@ -10,7 +10,7 @@
  :jolt
  {:repo "casselc/jolt"
   :tag "v0.8.0"
-  :sha "ccd6a73f"
+  :sha "ccd6a73fd20b8e69cba654e008024958d5b4bd8a"
   :installed-to "$HOME/.local/bin/jolt"
   ;; DEVIATION FROM config/repos.lock.tsv, recorded per AGENTS.md.
   ;; The lock pins 33a1bfc44010c0a3dd61ba6dce8e67303ffe0cff, which reports
@@ -21,28 +21,53 @@
   :override-reason "toolchain.env floor is 0.8.0; lock pin predates it"}
 
  :llama-cpp
- {;; Recovered from the frozen Halo evidence, NOT guessed. This is the build
-  ;; the exact-spine gate ran on.
-  :upstream-of "isHuangXin/llama.cpp (BitNet fork), vendored at BitNet/3rdparty/llama.cpp"
-  :sha "390c307752ab78fd8189f359d6954c9ba1be74af"
-  :subject "Fix build-cann workflow by adding placeholder job"
-  ;; IMPORTANT: the coordinate is NOT a clean SHA. The working tree carries
-  ;; uncommitted BitNet CPU-kernel changes (+164 lines across
-  ;; ggml/src/ggml-cpu/{CMakeLists.txt,ggml-cpu.c}). The diff is captured at
-  ;; docs/llamacpp-worktree.diff so the build is reproducible.
-  :working-tree-dirty true
-  :worktree-diff "docs/llamacpp-worktree.diff"
+ {;; ---- PROMOTED v0 COORDINATE (clean, pinned, builds standalone)
+  :repo "ggml-org/llama.cpp"
+  :sha "b81c99b479d4c24e5eeca10de99032ebd343ef8f"
+  :working-tree-dirty false
+  :build-dir "build-clean"
   :build-flags ["-DCMAKE_BUILD_TYPE=Release" "-DGGML_NATIVE=ON" "-DGGML_OPENMP=ON"
                 "-DGGML_VULKAN=OFF" "-DLLAMA_CURL=OFF" "-DBUILD_SHARED_LIBS=ON"]
-  :note "XDNA/NPU offload is compiled out; this pass is CPU-only by design."}
+  :api-difference
+  "Upstream replaced llama_model_params' use_mmap/use_mlock booleans with a
+   single load_mode enum. The shim absorbs it -- native/Makefile probes
+   llama.h for `enum llama_load_mode` and defines JL_HAS_LOAD_MODE, so one
+   source builds against both APIs and jl_model_params keeps its two booleans.
+   Probed rather than version-gated because llama.cpp exposes no API version
+   macro. This is the ONLY difference the clean build required."
+  :gate-result
+  "PASSES. Logits bit-identical to the experimental build: token 11751 at
+   -1.555883. M1 max_abs_dlogprob 0.00000000 at 4.01x, same 1-token BPE seam.
+   State blob is 20263652 bytes here vs 20263632 on the fork -- a 20-byte
+   serialization difference, which is why state carries an ABI and a model
+   content id rather than being assumed portable."
 
- :jolt-hegel
- {:repo "chucklehead-dev/jolt-hegel"
-  :git-sha "2186afd9fef8b8ba766af5ea06b517e6af36cd4e"
-  :libhegel "v0.33.3 linux-amd64, sha256-verified by hegel.install"
-  :scope "TEST ONLY. Lives in deps.edn's :test alias. The core library runs on
-          stock Jolt with no jolt-hegel present; nothing in src/ requires it."
-  :install "JOLT_CACHE_DIR must be ABSOLUTE; a relative path fails in aot-mkdir-p"}
+  ;; ---- PRIOR EXPERIMENTAL COORDINATE, retained as evidence, NOT promoted
+  :prior
+  {:sha "390c307752ab78fd8189f359d6954c9ba1be74af"
+   :subject "Fix build-cann workflow by adding placeholder job"
+   :upstream-of "isHuangXin/llama.cpp (BitNet fork), vendored at BitNet/3rdparty/llama.cpp"
+   :working-tree-dirty true
+   :worktree-diff "docs/llamacpp-worktree.diff"
+   :why-not-promoted
+   "Two reasons. The captured diff is XDNA2/NPU offload for BitNet I2_S GEMMs,
+    gated behind BITNET_XDNA_RUNTIME_DIR at build time and BITNET_XDNA=1 at
+    runtime -- inert for Qwen3.5 Q4_0, which never takes the I2_S path -- so it
+    was not NEEDED. And the commit is a FORK commit, not an upstream ancestor:
+    `gh api repos/ggml-org/llama.cpp/commits/390c3077` resolves it only because
+    forks share a commit network, and `compare` reports it as diverged. Its
+    ggml-cpu CMakeLists references ../../../../src/ggml-bitnet-lut.cpp, a file
+    in BitNet's parent tree, so it cannot build standalone at all. A dependency
+    that only builds inside another project is not a promotion coordinate."}}
+
+ :jolt-llama-results
+ {:repo "casselc/jolt-llama"
+  :reviewed-branch "agent/onbox/embedded-libllama-v0"
+  :reviewed-sha "6ec88472bc63371ac9b70729ffbd58e35f35ce8d"
+  :hardening-branch "agent/onbox/v0-safety-hardening"
+  :note "The Samizdat embedded-controller canary was run against the reviewed
+         sha and its evidence is not rewritten; the hardened coordinate is a
+         separate one, regression-tested against that canary."}
 
  :halo-evidence
  {:repo "casselc/bitnet-xdna2-strix-halo"

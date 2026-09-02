@@ -139,8 +139,22 @@ jl_status jl_model_open(const char *path, const jl_model_params *params, jl_mode
 
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = p.n_gpu_layers;
+    /*
+     * llama.cpp replaced the use_mmap/use_mlock booleans with a single
+     * load_mode enum. Absorbing that here is exactly what this shim is for:
+     * jl_model_params keeps the two booleans, so no caller changes, and the
+     * Makefile probes llama.h for `enum llama_load_mode` and defines
+     * JL_HAS_LOAD_MODE. Probed rather than version-gated because llama.cpp
+     * carries no API version macro to test.
+     */
+#ifdef JL_HAS_LOAD_MODE
+    mp.load_mode = p.use_mmap
+                     ? (p.use_mlock ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP)
+                     : (p.use_mlock ? LLAMA_LOAD_MODE_MLOCK      : LLAMA_LOAD_MODE_NONE);
+#else
     mp.use_mmap     = p.use_mmap  ? true : false;
     mp.use_mlock    = p.use_mlock ? true : false;
+#endif
 
     struct llama_model *m = llama_model_load_from_file(path, mp);
     if (!m) { jl_set_error("llama_model_load_from_file failed for '%s'", path); return JL_ERR_MODEL_LOAD; }
