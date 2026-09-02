@@ -135,8 +135,16 @@ export JOLT_LLAMA_MODEL=/path/to/model.gguf
 ./scripts/run-tests.sh probes     # the exactness investigation
 ```
 
-`scripts/run-tests.sh` sources a gitignored `.env.local` if present, so no path
-in this repository is specific to any machine.
+`scripts/run-tests.sh` sources a gitignored env file if present -- `.env.clean`
+by preference, then `.env.local` -- so no path in this repository is specific to
+any machine.
+
+**Keep exactly one of them authoritative.** They began as copies and drifted:
+`.env.local` went on pointing `LD_LIBRARY_PATH` at an older llama.cpp than the
+shim was linked against, which is precisely the cross-build mismatch
+`:runtime-id` exists to detect. The runner preferring `.env.clean` meant the
+suite was fine and only a hand-run `source .env.local` was wrong, which is the
+worst shape for a trap. If you keep both, make one a single `.` of the other.
 
 Property tests additionally need the `:test` alias and a one-time install:
 

@@ -6,7 +6,7 @@
 #   JOLT_LLAMA_MODEL  path to a .gguf model
 #   JOLT_CACHE_DIR    writable AOT cache         (optional but recommended)
 #
-# Optional: source a gitignored .env.local from the repo root to set these.
+# Optional: source a gitignored env file from the repo root to set these.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
