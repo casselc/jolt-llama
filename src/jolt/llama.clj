@@ -339,13 +339,28 @@
 
 ;; -------------------------------------------------------------------- state
 
-(defn- sha256-hex
+(defn- digest-seq
   "Content hash for provenance. Falls back to a cheap stable digest when no
   crypto is available, since this identifies a state to us, not to the world."
-  [bytes]
+  [xs]
   (let [h (reduce (fn [acc b] (unchecked-int (+ (* 31 acc) (bit-and b 0xff))))
-                  (int 17) bytes)]
+                  (int 17) xs)]
     (format "%08x" (bit-and h 0xffffffff))))
+
+(defn- digest-array
+  "The same digest over the first `n` bytes of an array, WITHOUT seqing it.
+
+  `(reduce f init (take 4096 blob))` looks equivalent and is not: taking a seq
+  over a 54 MB byte array walks the whole array before `take` sees its first
+  element. That one expression cost 7.4 of the 7.6 seconds save-state spent, and
+  made state capture look 41x slower than state restore for what is the same
+  memcpy in both directions. Index the array instead."
+  [arr n]
+  (let [limit (min (int n) (alength arr))]
+    (loop [i 0 h (int 17)]
+      (if (>= i limit)
+        (format "%08x" (bit-and h 0xffffffff))
+        (recur (inc i) (unchecked-int (+ (* 31 h) (bit-and (aget arr i) 0xff))))))))
 
 (defn save-state
   "Capture exact native state for a sequence, bound to its token vector.
@@ -372,9 +387,9 @@
               :seq-id seq-id
               :tokens toks
               :n-tokens (count toks)
-              :token-hash (sha256-hex (map int toks))
+              :token-hash (digest-seq (map int toks))
               :state-bytes written
-              :state-hash (sha256-hex (take 4096 blob))
+              :state-hash (digest-array blob 4096)
               :abi (c-abi-version)
               ::blob blob})))))))
 
@@ -422,6 +437,116 @@
 
 ;; -------------------------------------------------------- candidate scoring
 
+(defn- topk-map [session k]
+  (into {} (map (juxt :token :logprob) (top-k session k {:pieces? false}))))
+
+(defn- max-abs-delta [a b]
+  (let [common (filter b (keys a))]
+    (if (seq common)
+      (apply max (map #(abs (- (double (a %)) (double (b %)))) common))
+      -1.0)))
+
+(defn append-divergence
+  "Compare `prefix ++ suffix` evaluated as TWO calls against the same tokens
+  evaluated as ONE call.
+
+  Returns a MAP, not a number, because a single number here is misleading. The
+  obvious metric -- max |delta logprob| over the top-k -- is dominated by tokens
+  at p ~ 1e-8, where a float32 logit of magnitude 20 carries absolute error in
+  the 0.1 nat range purely from having ~7 significant digits. Measured on
+  Qwen3.5-0.8B, two kernel paths that agree to 0.00046 nats at rank 0 (p=0.993)
+  differ by 0.286 at rank 30 (p~1e-8). Reporting only the max would call that a
+  serious divergence; it is not. See docs/EXACTNESS.md.
+
+    :bit-exact?    true when every common logprob matched exactly
+    :top1-abs      |delta| for the argmax -- the number that matters for policy
+    :max-abs       worst over the top-k, tail included
+    :top1-same?    whether the argmax token itself agreed
+    :order-same?   whether the top-5 ordering agreed
+    :n-common
+
+  DESTRUCTIVE: clears the session. Intended for calibration and tests."
+  ([session prefix suffix] (append-divergence session prefix suffix {}))
+  ([session prefix suffix {:keys [k seq-id] :or {k 50 seq-id 0}}]
+   (let [prefix (vec prefix) suffix (vec suffix)
+         full   (into prefix suffix)
+         _      (clear! session seq-id)
+         _      (eval! session full {:seq-id seq-id})
+         one    (top-k session k {:pieces? false})
+         one-m  (into {} (map (juxt :token :logprob) one))
+         _      (clear! session seq-id)
+         _      (eval! session prefix {:seq-id seq-id})
+         _      (eval! session suffix {:seq-id seq-id})
+         two    (top-k session k {:pieces? false})
+         two-m  (into {} (map (juxt :token :logprob) two))
+         common (filter two-m (keys one-m))
+         ds     (map #(abs (- (double (one-m %)) (double (two-m %)))) common)
+         t1     (:token (first one))]
+     {:bit-exact?  (every? zero? ds)
+      :top1-abs    (when-let [b (two-m t1)]
+                     (abs (- (double (one-m t1)) (double b))))
+      :max-abs     (if (seq ds) (apply max ds) -1.0)
+      :top1-same?  (= t1 (:token (first two)))
+      :order-same? (= (mapv :token (take 5 one)) (mapv :token (take 5 two)))
+      :n-common    (count common)})))
+
+(defn calibrate-append-exactness
+  "Find the shortest append length that still reproduces a one-pass evaluation,
+  by measurement rather than assumption.
+
+  The threshold is a property of the MODEL, not of this library, so it is not
+  hard-coded. On the Qwen3.5-0.8B hybrid used here it measures at 64, matching
+  the fused Gated Delta Net chunk size the loader announces; a pure-attention
+  model is expected to measure 1.
+
+  `probe-tokens` must be a real token vector from the model, long enough for
+  `prefix-len + max-suffix`. Exactness is monotone in suffix length for the
+  models measured so far, so this binary-searches; :verified names the lengths
+  actually probed so a non-monotone model is visible rather than hidden.
+
+  Returns
+    :threshold      shortest suffix length that matched one-pass, or nil
+    :max-suffix     the search ceiling
+    :monotone?      whether every probe was consistent with a single threshold
+    :probes         [{:suffix-len n :divergence d :exact? bool} ...]
+
+  DESTRUCTIVE: clears the session."
+  ([session probe-tokens] (calibrate-append-exactness session probe-tokens {}))
+  ([session probe-tokens {:keys [prefix-len max-suffix tolerance seq-id]
+                          :or {prefix-len 128 max-suffix 256 tolerance 1e-9 seq-id 0}}]
+   (let [toks (vec probe-tokens)]
+     (when (< (count toks) (+ prefix-len max-suffix))
+       (throw (ex-info "jolt.llama/calibrate-append-exactness: probe-tokens too short"
+                       {:jolt.llama/op :calibrate-append-exactness
+                        :jolt.llama/error :error/invalid-arg
+                        :jolt.llama/need (+ prefix-len max-suffix)
+                        :jolt.llama/have (count toks)})))
+     (let [prefix (subvec toks 0 prefix-len)
+           probes (atom [])
+           exact? (fn [n]
+                    (let [r (append-divergence session prefix
+                                                (subvec toks prefix-len (+ prefix-len n))
+                                                {:seq-id seq-id})
+                          ok (or (:bit-exact? r) (< (:max-abs r) tolerance))]
+                      (swap! probes conj (assoc (select-keys r [:max-abs :top1-abs :top1-same?])
+                                                :suffix-len n :exact? ok))
+                      ok))]
+       (if-not (exact? max-suffix)
+         ;; nothing in range is exact; report that honestly instead of guessing
+         {:threshold nil :max-suffix max-suffix :monotone? true :probes @probes}
+         (loop [lo 1 hi max-suffix]
+           (if (>= lo hi)
+             (let [ps @probes
+                   t lo
+                   ;; a single threshold explains the data only if every probe
+                   ;; below t diverged and every probe at or above t matched
+                   mono (every? (fn [{:keys [suffix-len exact?]}]
+                                  (= exact? (>= suffix-len t)))
+                                ps)]
+               {:threshold t :max-suffix max-suffix :monotone? mono :probes (vec ps)})
+             (let [mid (quot (+ lo hi) 2)]
+               (if (exact? mid) (recur lo mid) (recur (inc mid) hi))))))))))
+
 (defn score-candidates
   "Score a finite set of legal candidates against the CURRENT session state.
 
@@ -448,10 +573,36 @@
   one is how incomparable conventions creep in. Sorted by :logprob-sum
   descending; :rank is the index under that ordering.
 
+  SCORING CONVENTION, stated because it is not free of consequence.
+
+  A candidate's first token is read from the base logits, which were produced by
+  whatever call evaluated the base -- normally a long prefill. Its remaining
+  tokens are reached by single-token decodes. On a hybrid model those are two
+  different kernel paths (see docs/EXACTNESS.md and calibrate-append-exactness),
+  so a multi-token score mixes them while a single-token score does not.
+
+  What follows from that:
+    * single-token candidates are exactly comparable with each other
+    * equal-length candidates are exactly comparable with each other
+    * unequal-length candidates are comparable, but their sums are not built
+      from an identical mixture of paths, so a near-tie between a 1-token and a
+      4-token candidate should not be read as meaningful
+    * NONE of these scores are comparable against a logprob obtained by
+      prefilling the candidate text as part of one long prompt
+
+  The result map reports :convention and :homogeneous? so a caller can assert
+  the case it actually relies on instead of assuming it.
+
   Requires :state (from save-state) when any candidate has more than one token,
-  since rewinding to the base otherwise means re-evaluating it per candidate."
+  since rewinding to the base otherwise means re-evaluating it per candidate.
+
+  After scoring multi-token candidates the session holds the restored base state
+  but no logits, because that is what load-state! guarantees. To score the same
+  base again, pass the previous result's :base-logprobs back in as the
+  :base-logprobs option; do NOT re-evaluate a token to regenerate them, since
+  that would move the base onto a different kernel path."
   ([session candidates] (score-candidates session candidates {}))
-  ([session candidates {:keys [seq-id state] :or {seq-id 0}}]
+  ([session candidates {:keys [seq-id state base-logprobs] :or {seq-id 0}}]
    (when (empty? candidates)
      (throw (ex-info "jolt.llama/score-candidates: empty candidate set"
                      {:jolt.llama/op :score-candidates
@@ -473,8 +624,17 @@
          ;; One read of the base distribution serves every candidate's first
          ;; token. Doing this before any restore is what keeps the single-token
          ;; path free of evaluation.
-         base-lp (into {} (map (fn [t] [t (token-logprob session t)])
-                               (distinct (map (comp first :tokens) candidates))))
+         first-tokens (distinct (map (comp first :tokens) candidates))
+         ;; Scoring a multi-token candidate ends with a restore, and a restore
+         ;; deliberately leaves the session with no logits (M0 asserts this: a
+         ;; restored state has not produced an output position). So a second
+         ;; call against the same base cannot read the base distribution again.
+         ;; Rather than re-evaluate -- which would land on a different kernel
+         ;; path and silently change the scoring convention -- the base
+         ;; log-probabilities are returned, and accepted back here.
+         base-lp (if (and base-logprobs (every? base-logprobs first-tokens))
+                   (select-keys base-logprobs first-tokens)
+                   (into {} (map (fn [t] [t (token-logprob session t)]) first-tokens)))
          scored
          (doall
           (for [{:keys [id tokens] :as cand} candidates]
@@ -511,7 +671,13 @@
      {:candidates ranked
       :best (first ranked)
       :n-candidates (count ranked)
-      :base-n-tokens base-n})))
+      :base-n-tokens base-n
+      ;; named so a caller can assert on it; see the docstring
+      ;; feed this back as :base-logprobs to score the same base again after a
+      ;; restore has cleared the session's logits
+      :base-logprobs base-lp
+      :convention :teacher-forced/first-from-base-rest-single-token
+      :homogeneous? (= 1 (count (distinct (map :n-tokens ranked))))})))
 
 ;; ------------------------------------------------------------------- close
 

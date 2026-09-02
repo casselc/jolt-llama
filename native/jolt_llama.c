@@ -321,12 +321,33 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
      * Built by hand rather than via llama_batch_get_one so we control seq_id
      * and request logits for the final token only. Chunked at n_batch because
      * a caller may hand us a whole 1600-token spine at once.
+     *
+     * The chunks are BALANCED rather than greedy, and that is a correctness
+     * property, not tidiness. Hybrid models select a kernel by batch size: this
+     * repo measured a Gated Delta Net model with three self-consistent
+     * paths, switching at 2 and at 64 tokens, so a decode call carrying fewer
+     * than 64 tokens runs different arithmetic than the same tokens inside a
+     * larger call. The head of the distribution barely moves (top-1 agrees to
+     * 5e-4 nats) but the tail does, and mixing regimes makes scores
+     * incomparable at that scale. Greedy chunking of 2056 tokens at n_batch 2048
+     * emits a 2048 chunk and then an 8-token chunk, silently putting the tail
+     * of an ordinary prefill on the short-kernel path. Balanced chunking emits
+     * 1028 + 1028 instead. See docs/EXACTNESS.md.
+     *
+     * This does not and cannot make a short caller-supplied append exact; it
+     * only stops the shim from manufacturing a short chunk on its own.
      */
     const uint32_t n_batch = llama_n_batch(session->ctx);
+    const size_t n_chunks = (n_tokens + n_batch - 1) / n_batch;
+    const size_t base_len = n_tokens / n_chunks;
+    const size_t remainder = n_tokens % n_chunks;
+
     size_t off = 0;
-    while (off < n_tokens) {
-        const size_t chunk = (n_tokens - off) < (size_t) n_batch ? (n_tokens - off) : (size_t) n_batch;
-        const int last_chunk = (off + chunk) == n_tokens;
+    for (size_t ci = 0; ci < n_chunks; ci++) {
+        /* spread the remainder one token at a time over the leading chunks, so
+         * chunk sizes differ by at most 1 and none is pathologically small */
+        const size_t chunk = base_len + (ci < remainder ? 1 : 0);
+        const int last_chunk = (ci + 1) == n_chunks;
 
         struct llama_batch batch = llama_batch_init((int32_t) chunk, 0, 1);
         if (!batch.token) { jl_set_error("llama_batch_init failed"); return JL_ERR_ALLOC; }
