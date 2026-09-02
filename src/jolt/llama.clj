@@ -761,15 +761,23 @@
   at p ~ 1e-8, where a float32 logit of magnitude 20 carries absolute error in
   the 0.1 nat range purely from having ~7 significant digits. Measured on
   Qwen3.5-0.8B, two kernel paths that agree to 0.00046 nats at rank 0 (p=0.993)
-  differ by 0.286 at rank 30 (p~1e-8). Reporting only the max would call that a
-  serious divergence; it is not. See docs/EXACTNESS.md.
+  differ by 0.286 at rank 30 (p~1e-8). See docs/EXACTNESS.md.
 
-    :bit-exact?    true when every common logprob matched exactly
+  BIT EXACTNESS IS DEFINED OVER THE WHOLE COMPARED VECTOR, not an intersection.
+  It requires the same number of entries, the same token ids IN THE SAME ORDER,
+  and identical raw float bits for every one. An earlier version compared only
+  the ids present in both maps, so a 90-of-100 overlap could report
+  :bit-exact? true -- and an EMPTY intersection reported it too, because
+  `every?` over nothing is true. A gate documented as bit-exact over 100
+  entries must not pass on 90, and must never pass on 0.
+
+    :bit-exact?    identical length, order and raw bits
+    :order-same?   the top-5 ids agreed
+    :top1-same?    the argmax agreed
     :top1-abs      |delta| for the argmax -- the number that matters for policy
-    :max-abs       worst over the top-k, tail included
-    :top1-same?    whether the argmax token itself agreed
-    :order-same?   whether the top-5 ordering agreed
-    :n-common
+    :max-abs       worst over the compared entries, tail included
+    :n-a :n-b      entries returned by each arm
+    :n-common      ids present in both
 
   DESTRUCTIVE: clears the session. Intended for calibration and tests."
   ([session prefix suffix] (append-divergence session prefix suffix {}))
@@ -778,22 +786,29 @@
          full   (into prefix suffix)
          _      (clear! session)
          _      (eval! session full {:seq-id seq-id})
-         one    (top-k session k {:pieces? false})
-         one-m  (into {} (map (juxt :token :logprob) one))
+         one    (top-k session k {:pieces? false :bits? true})
          _      (clear! session)
          _      (eval! session prefix {:seq-id seq-id})
          _      (eval! session suffix {:seq-id seq-id})
-         two    (top-k session k {:pieces? false})
+         two    (top-k session k {:pieces? false :bits? true})
+         one-m  (into {} (map (juxt :token :logprob) one))
          two-m  (into {} (map (juxt :token :logprob) two))
          common (filter two-m (keys one-m))
          ds     (map #(abs (- (double (one-m %)) (double (two-m %)))) common)
-         t1     (:token (first one))]
-     {:bit-exact?  (every? zero? ds)
+         t1     (:token (first one))
+         ;; the whole vector, in order, by raw bits
+         exact? (and (pos? (count one))
+                     (= (count one) (count two))
+                     (= (mapv :token one) (mapv :token two))
+                     (= (mapv :bits one) (mapv :bits two)))]
+     {:bit-exact?  exact?
       :top1-abs    (when-let [b (two-m t1)]
                      (abs (- (double (one-m t1)) (double b))))
       :max-abs     (if (seq ds) (apply max ds) -1.0)
       :top1-same?  (= t1 (:token (first two)))
       :order-same? (= (mapv :token (take 5 one)) (mapv :token (take 5 two)))
+      :n-a         (count one)
+      :n-b         (count two)
       :n-common    (count common)})))
 
 (defn calibrate-append-exactness
@@ -833,7 +848,10 @@
                     (let [r (append-divergence session prefix
                                                 (subvec toks prefix-len (+ prefix-len n))
                                                 {:seq-id seq-id})
-                          ok (or (:bit-exact? r) (< (:max-abs r) tolerance))]
+                          ;; STRICT: the whole vector by raw bits. Falling back
+                          ;; to a tolerance on max-abs would let a partial or
+                          ;; reordered comparison satisfy a bit-exact claim.
+                          ok (:bit-exact? r)]
                       (swap! probes conj (assoc (select-keys r [:max-abs :top1-abs :top1-same?])
                                                 :suffix-len n :exact? ok))
                       ok))]

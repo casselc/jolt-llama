@@ -93,7 +93,7 @@
                      t1 (System/currentTimeMillis)
                      _ (llama/eval! s suffix)
                      t-eval (- (System/currentTimeMillis) t1)
-                     top (llama/top-k s 5)
+                     top (llama/top-k s 5 {:bits? true})
                      text (apply str (map :piece top))]
                  ;; verify against a fresh recompute every 10th cycle: the only
                  ;; check that distinguishes "restored" from merely "plausible"
@@ -101,12 +101,18 @@
                        (when (zero? (mod c 10))
                          (llama/clear! s)
                          (llama/eval! s full)
-                         (let [ref (llama/top-k s 5 {:pieces? false})]
-                           ;; `ref` is the fresh recompute; `top` above came from
-                           ;; the restore path. Comparing those two is the check.
+                         (let [ref (llama/top-k s 5 {:pieces? false :bits? true})]
+                           ;; `ref` is the fresh recompute; `top` came from the
+                           ;; restore path. Comparing only the top-1 TOKEN was
+                           ;; far too weak to be called "no numerical mismatch":
+                           ;; two distributions can agree on their argmax and
+                           ;; differ everywhere else. The oracle is now the full
+                           ;; compared vector by RAW BITS.
                            {:ref-top1 (:token (first ref))
                             :restored-top1 (:token (first top))
-                            :match (= (:token (first ref)) (:token (first top)))}))
+                            :match (and (= (mapv :token ref) (mapv :token top))
+                                        (= (mapv :bits ref) (mapv :bits top)))
+                            :top1-only (= (:token (first ref)) (:token (first top)))}))
                        foreign (filterv #(and (not= % (:tag d))
                                               (clojure.string/includes? text %)) tags)]
                    {:cycle c :domain i :restore-ms t-restore :eval-ms t-eval
@@ -126,10 +132,38 @@
         (println (format "REF: verified_cycles=%d mismatches=%d contaminated=%d"
                          (count verified) (count mismatches) (count contaminated)))
 
+        ;; REPEATABILITY: the same (domain, epoch) evaluated again after other
+        ;; domains have occupied the session must be bit-identical to its first
+        ;; result. This is the contamination oracle that actually holds; the tag
+        ;; heuristic below only samples five top-k pieces and cannot establish
+        ;; absence of leakage.
+        (let [d0 (first domains)
+              st0 (first states)
+              once (fn []
+                     (let [full (llama/tokenize m (str (:spine d0) (domain-delta 0 4242)))]
+                       (llama/clear! s)
+                       (llama/load-state! s st0 full)
+                       (llama/eval! s (vec (drop (:n-tokens st0) full)))
+                       (llama/top-k s 20 {:pieces? false :bits? true})))
+              a (once)
+              ;; let the other domains occupy the session in between
+              _ (doseq [i [1 2]]
+                  (let [di (nth domains i) sti (nth states i)
+                        f (llama/tokenize m (str (:spine di) (domain-delta i 99)))]
+                    (llama/clear! s)
+                    (llama/load-state! s sti f)
+                    (llama/eval! s (vec (drop (:n-tokens sti) f)))))
+              b (once)]
+          (println (format "REF: repeat_bits_identical=%s n=%d"
+                           (= (mapv :bits a) (mapv :bits b)) (count a)))
+          (check "a repeated (domain, epoch) is bit-identical after other domains ran"
+                 (and (= (mapv :token a) (mapv :token b))
+                      (= (mapv :bits a) (mapv :bits b)))))
+
         ;; per-domain determinism: the same domain must give the same answer for
         ;; the same epoch regardless of what ran in between
         (check "every cycle produced a top-1" (every? :top1 results))
-        (check "no numerical mismatch against recompute" (zero? (count mismatches)))
+        (check "restore is bit-identical to a fresh recompute" (zero? (count mismatches)))
         (check "no foreign-domain tag leaked" (zero? (count contaminated)))
         (check "restore stayed fast" (< (p restore-times 0.95) 2000))
         (check "ran the requested number of cycles" (= cycles (count results)))))))

@@ -93,7 +93,7 @@
       (let [t0 (now-ms)
             _  (llama/eval! s all-tokens)
             t-full (- (now-ms) t0)
-            top-a (llama/top-k s 100 {:pieces? false})
+            top-a (llama/top-k s 100 {:pieces? false :bits? true})
             lp-a  (into {} (map (juxt :token :logprob) top-a))]
         (println (format "REF: full_recompute_ms=%d n_tokens=%d top1=%d"
                          t-full (count all-tokens) (:token (first top-a))))
@@ -119,7 +119,7 @@
                 t4 (now-ms)
                 _  (llama/eval! s suffix)
                 t-delta (- (now-ms) t4)
-                top-b (llama/top-k s 100 {:pieces? false})
+                top-b (llama/top-k s 100 {:pieces? false :bits? true})
                 lp-b  (into {} (map (juxt :token :logprob) top-b))
                 common (filter lp-b (keys lp-a))
                 deltas (map #(abs (- (double (lp-a %)) (double (lp-b %)))) common)
@@ -131,13 +131,25 @@
             (println (format "REF: warm_total_ms=%d vs full_ms=%d speedup=%.2fx"
                              (+ t-restore t-delta) t-full
                              (double (/ t-full (max 1 (+ t-restore t-delta))))))
+            (println (format "REF: bits_identical=%s n_a=%d n_b=%d"
+                             (= (mapv :bits top-a) (mapv :bits top-b))
+                             (count top-a) (count top-b)))
             (println (format "REF: n_common_topk=%d max_abs_dlogprob=%.8f mean_abs_dlogprob=%.8f"
                              (count common) (double (or max-d 0)) (double (or mean-d 0))))
             (println (format "REF: top1_A=%d top1_B=%d"
                              (:token (first top-a)) (:token (first top-b))))
 
             (check "restore+delta reproduces top-1" (= (:token (first top-a)) (:token (first top-b))))
-            (check "top-k sets overlap substantially" (>= (count common) 90))
+            ;; FULL comparison, not an overlap. 90 of 100 used to pass a gate
+            ;; documented as bit-exact over 100 entries; identical ids in
+            ;; identical ORDER with identical raw float bits is what the claim
+            ;; actually says.
+            (check "both arms returned the full top-k"
+                   (= 100 (count top-a) (count top-b)))
+            (check "token ids identical and in the same order"
+                   (= (mapv :token top-a) (mapv :token top-b)))
+            (check "raw float bits identical for every entry"
+                   (= (mapv :bits top-a) (mapv :bits top-b)))
             ;; The Halo gate measured exactly 0.000000 for this model on this
             ;; protocol. Anything above the float32 noise floor is a real
             ;; divergence, not rounding.
