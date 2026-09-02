@@ -36,6 +36,14 @@
                 "-DGGML_VULKAN=OFF" "-DLLAMA_CURL=OFF" "-DBUILD_SHARED_LIBS=ON"]
   :note "XDNA/NPU offload is compiled out; this pass is CPU-only by design."}
 
+ :jolt-hegel
+ {:repo "chucklehead-dev/jolt-hegel"
+  :git-sha "2186afd9fef8b8ba766af5ea06b517e6af36cd4e"
+  :libhegel "v0.33.3 linux-amd64, sha256-verified by hegel.install"
+  :scope "TEST ONLY. Lives in deps.edn's :test alias. The core library runs on
+          stock Jolt with no jolt-hegel present; nothing in src/ requires it."
+  :install "JOLT_CACHE_DIR must be ABSOLUTE; a relative path fails in aot-mkdir-p"}
+
  :halo-evidence
  {:repo "casselc/bitnet-xdna2-strix-halo"
   :branch "exact-spine-runtime-gate"

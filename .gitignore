@@ -6,6 +6,7 @@ native/smoke
 target/
 .cpcache/
 .jolt/
+.jolt-cache/
 
 # never commit model weights or state blobs
 *.gguf
@@ -16,3 +17,4 @@ models/
 # local scratch
 /tmp/
 *.log
+.env.local
