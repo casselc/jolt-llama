@@ -176,7 +176,12 @@ jl_status jl_session_close(jl_session *session);
 
 uint32_t  jl_session_n_ctx(const jl_session *session);
 
-/* Drop all cached state for one sequence. seq_id < 0 clears every sequence. */
+/*
+ * Drop the cached state for sequence 0. seq_id must be 0: v0 is
+ * single-sequence, and the old contract -- where a negative id cleared EVERY
+ * sequence -- gave a caller who passed -1 by accident a different operation
+ * than the one they named.
+ */
 jl_status jl_session_clear(jl_session *session, int32_t seq_id);
 
 /* ----------------------------------------------------------- tokenize */

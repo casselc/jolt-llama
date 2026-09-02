@@ -140,10 +140,25 @@
   shim ABI cannot stand in for that, since the shim can be byte-identical
   across two different llama.cpp trees.
 
-  A build with no coordinate reports \"unknown:...\", which never matches
-  anything, so an unattributable state is refused rather than trusted."
+  A build with no coordinate reports \"unknown:...\". That string is never
+  treated as an identity -- see `unattributed?` -- because equality alone would
+  let two shims built from two unidentified trees exchange state, which is the
+  case the check exists to stop."
   []
   (ffi/ptr->string (c-runtime-build-id)))
+
+(defn unattributed?
+  "Whether a runtime id fails to identify anything.
+
+  Anything that is nil, blank, or announces itself as unknown. Checked
+  explicitly rather than relying on inequality: \"unknown:x\" equals
+  \"unknown:x\", so a pure equality test would ACCEPT a state saved by an
+  unidentified build into another unidentified build."
+  [id]
+  (or (nil? id)
+      (not (string? id))
+      (clojure.string/blank? id)
+      (clojure.string/starts-with? id "unknown:")))
 
 (defn- ensure-abi! []
   (let [got (c-abi-version)]
@@ -425,9 +440,17 @@
 
 (defn top-k
   "Top-k [{:token id :logprob lp :piece s}] descending, log-softmax normalised
-  over the whole vocabulary so scores are comparable across calls."
+  over the whole vocabulary so scores are comparable across calls.
+
+  With `:bits? true` each entry also carries `:bits`, the raw IEEE-754
+  representation of its score as 8 hex digits, read from the SAME native buffer
+  rather than reconstructed. Printed decimals cannot establish bit identity --
+  two different floats render identically at six places -- so any gate that
+  claims exactness has to compare representations. Jolt runs on Chez, not the
+  JVM, so Float/floatToRawIntBits is not available and the bits are taken by
+  reading the buffer as uint32."
   ([session k] (top-k session k {}))
-  ([session k {:keys [pieces?] :or {pieces? true}}]
+  ([session k {:keys [pieces? bits?] :or {pieces? true bits? false}}]
    (let [p (session-ptr session)
          model (:model session)]
      (ffi/with-alloc [tbuf (* k 4)]
@@ -439,6 +462,9 @@
                      (let [tok (ffi/read tbuf :int32 (* i 4))]
                        (cond-> {:token tok
                                 :logprob (ffi/read lbuf :float (* i 4))}
+                         bits? (assoc :bits (format "%08x"
+                                                    (bit-and (ffi/read lbuf :uint32 (* i 4))
+                                                             0xffffffff)))
                          pieces? (assoc :piece (token->piece model tok)))))
                    (range n)))))))))
 
@@ -569,6 +595,12 @@
       (not (vector? (:tokens state)))          :state/malformed
       (not= (:n-tokens state) (count (:tokens state))) :state/malformed
       (not= (:abi state) abi-expected)         :state/abi-mismatch
+      ;; UNATTRIBUTABLE first. String equality would let "unknown:x" match
+      ;; "unknown:x", so two shims built from two unidentified trees would
+      ;; happily exchange state -- which is the exact case the runtime check
+      ;; exists to stop. An unknown coordinate is not a coordinate.
+      (or (unattributed? (:runtime-id state))
+          (unattributed? (runtime-build-id)))   :state/runtime-unattributed
       ;; distinct from the ABI check on purpose: the shim can be byte-identical
       ;; across two llama.cpp trees that serialize state differently
       (not= (:runtime-id state) (runtime-build-id)) :state/runtime-mismatch
@@ -777,6 +809,24 @@
   This is the reason the library exists: trusted code constructs the legal
   domain, the model ranks it, trusted policy applies the result. No sampler, no
   grammar, no free-form generation.
+
+  PROMOTION SCOPE, v0.
+
+  The SINGLE-TOKEN path is promoted. Every candidate of exactly one token is
+  scored from one base distribution, needs no candidate evaluation, no saved
+  state and no rewind, touches neither native state nor the token ledger, and
+  is exactly comparable under the validated exactness contract.
+
+  The MULTI-TOKEN path is EXPERIMENTAL and is not covered by the v0 promotion
+  guarantee. It is correct on token identity -- the rewind state must be the
+  exact base token vector -- but token equality is not NUMERICAL equality. This
+  repository's own measurements show that the same token vector reached by a
+  different call structure produces different logits below the calibrated
+  append threshold, so a state saved from one structure can satisfy the token
+  check while representing a different numerical base than the logits the first
+  token was read from. Closing that needs the API to capture its own checkpoint,
+  or a session/revision identity on the descriptor. Until then, do not build on
+  multi-token scoring as if it carried the same proof as the single-token path.
 
   The caller must already have evaluated the base context (spine, or spine plus
   delta) so logits are available. Each candidate is {:id any :tokens [ids...]}.

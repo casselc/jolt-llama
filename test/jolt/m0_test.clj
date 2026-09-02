@@ -47,6 +47,18 @@
         (println "REF: n_logits=" (count lg))
         (check "logits sized to vocab" (= (count lg) (:n-vocab m))))
 
+      ;; ---- MACHINE ORACLE, diffed against native/smoke by run-tests.sh.
+      ;; The human-readable REF: lines below are for reading; these are the gate.
+      (let [tk10 (llama/top-k s 10 {:pieces? false :bits? true})]
+        (println (format "ORACLE abi=%d" (llama/abi-version)))
+        (println (format "ORACLE runtime=%s" (llama/runtime-build-id)))
+        (println (format "ORACLE n_tokens=%d" (count toks)))
+        (println (str "ORACLE tokens=" (clojure.string/join "," toks)))
+        (println (format "ORACLE n_vocab=%d" (:n-vocab m)))
+        (doseq [[i c] (map-indexed vector tk10)]
+          (println (format "ORACLE topk[%d]=%d:%s" i (:token c) (:bits c))))
+        (println (format "ORACLE state_bytes=%d" (:state-bytes (llama/save-state s)))))
+
       (let [tk (llama/top-k s 10)]
         (println "REF: topk:")
         (doseq [{:keys [token logprob piece]} tk]

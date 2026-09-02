@@ -77,6 +77,24 @@ int main(int argc, char **argv) {
     size_t n_top = 0;
     if ((st = jl_logits_topk(sess, K, tk, lp, &n_top)) != JL_OK) return fail("logits_topk", st);
 
+    /*
+     * MACHINE ORACLE. Six-decimal output cannot prove bit identity -- two
+     * different floats print the same -- so the comparable values are emitted
+     * as raw IEEE-754 bits on ORACLE: lines that scripts/run-tests.sh diffs
+     * against Jolt's. Anything a human reads stays below.
+     */
+    printf("ORACLE abi=%d\n", (int) jl_abi_version());
+    printf("ORACLE runtime=%s\n", jl_runtime_build_id());
+    printf("ORACLE n_tokens=%zu\n", n_tok);
+    printf("ORACLE tokens=");
+    for (size_t i = 0; i < n_tok; i++) printf("%s%d", i ? "," : "", toks[i]);
+    printf("\n");
+    printf("ORACLE n_vocab=%d\n", (int) jl_model_n_vocab(model));
+    for (size_t i = 0; i < n_top; i++) {
+        uint32_t bits;
+        memcpy(&bits, &lp[i], sizeof(bits));
+        printf("ORACLE topk[%zu]=%d:%08x\n", i, tk[i], bits);
+    }
     printf("topk:\n");
     for (size_t i = 0; i < n_top; i++) {
         char piece[64]; size_t np = 0;
@@ -88,6 +106,7 @@ int main(int argc, char **argv) {
     /* state round trip, exercised here so a Jolt-side failure is isolable */
     size_t n_state = 0;
     if ((st = jl_state_size(sess, 0, &n_state)) != JL_OK) return fail("state_size", st);
+    printf("ORACLE state_bytes=%zu\n", n_state);
     printf("state_bytes=%zu\n", n_state);
 
     uint8_t *blob = (uint8_t *) malloc(n_state);

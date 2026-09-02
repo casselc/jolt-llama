@@ -131,9 +131,21 @@
       (llama/clear! s)
       (llama/eval! s all)
       (let [st (llama/save-state s)
-            single (vec (for [a ["HOLD" "SCALE" "ROLLBACK" "RESTART" "PAGE"]]
-                          {:id (keyword (.toLowerCase a))
-                           :tokens (vec (take 1 (llama/tokenize m (str " " a) {:add-special? false})))}))
+            ;; VERIFIED encodings, not truncated ones. (take 1 (tokenize " ROLLBACK"))
+            ;; produced a one-token fixture out of a three-token label, so the
+            ;; "single-token candidate scoring" row measured a fragment and was
+            ;; not evidence about the controller ABI at all -- the same defect
+            ;; issue #8 closed in the canary, left behind here.
+            action-words ["hold" "scale" "rollback" "restart" "page"]
+            enc (into {} (for [a action-words]
+                           [a (vec (llama/tokenize m (str " " a) {:add-special? false}))]))
+            bad (into {} (filter (fn [[_ t]] (not= 1 (count t))) enc))
+            _ (when (seq bad)
+                (println "  NOTE: these encodings are not single-token under this"
+                         "model, so the single-token row below would be synthetic:")
+                (println "       " (pr-str (into {} (for [[a t] bad] [a (count t)])))))
+            single (vec (for [a action-words]
+                          {:id (keyword a) :tokens (enc a)}))
             multi  (vec (for [a ["HOLD" "SCALE" "ROLLBACK" "RESTART" "PAGE"]]
                           {:id (keyword (.toLowerCase a))
                            :tokens (vec (llama/tokenize m (str " " a) {:add-special? false}))}))
