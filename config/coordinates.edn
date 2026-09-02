@@ -62,6 +62,31 @@
 
  :jolt-llama-results
  {:repo "casselc/jolt-llama"
+  :final-branch "agent/onbox/v0-gate-oracle-correction"
+  :promoted-surface
+  "SINGLE-TOKEN candidate scoring. It reads every score from one base
+   distribution, needs no candidate evaluation, no saved state and no rewind,
+   and touches neither native state nor the token ledger -- so it cannot
+   desynchronise, structurally. Multi-token scoring is EXPERIMENTAL: its
+   numerical-base and atomicity holes are closed, but its guarantees rest on
+   identity checks and a recovery path rather than on that structural argument."
+  :state-coordinate
+  "shim ABI + native runtime build id + model content sha256 + seq id 0 +
+   exact token vector with an integrity SENTINEL + state byte count with a
+   sampled sentinel. For candidate rewind additionally: the originating
+   session id and evaluation revision, because token equality is not numerical
+   equality."
+  :integrity
+  "SENTINELS, not content hashes. sentinel-seq is a 32-bit polynomial value;
+   sentinel-array samples head, middle and tail plus the exact length. A real
+   SHA-256 needs java.security.MessageDigest, which Jolt reports as living in
+   io.github.jolt-lang/jolt-crypto rather than core -- verified, and the reason
+   :deps {} wins over a stronger digest until state crosses a process boundary."
+  :concurrency
+  "Handles are THREAD-CONFINED. Close is the exception: a CAS state machine
+   admits one closer, and a failed native close lands on :close-failed rather
+   than stranding at :closing. Runtime init is likewise CAS'd. Concurrent
+   inference on one session is NOT supported and is not claimed."
   :reviewed-branch "agent/onbox/embedded-libllama-v0"
   :reviewed-sha "6ec88472bc63371ac9b70729ffbd58e35f35ce8d"
   :hardening-branch "agent/onbox/v0-safety-hardening"
