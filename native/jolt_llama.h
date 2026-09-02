@@ -49,7 +49,26 @@ extern "C" {
 #define JL_ABI_VERSION 2
 
 int32_t     jl_abi_version(void);
-const char *jl_llama_build(void);   /* llama.cpp build/version string */
+/*
+ * A stable identity for the NATIVE RUNTIME that serialized a state blob.
+ *
+ * Not decoration. The promotion evidence measured the same model producing a
+ * 20263632-byte state on one llama.cpp build and 20263652 bytes on another, so
+ * native state is NOT portable across builds -- and the shim ABI does not imply
+ * native state-format compatibility, because the shim can be byte-identical
+ * across two different llama.cpp trees.
+ *
+ * Embedded at BUILD time from JL_LLAMA_BUILD_ID (see native/Makefile), never
+ * discovered by shelling out to git at inference time. A build that cannot
+ * determine its coordinate reports "unknown:..." rather than claiming a false
+ * one; for a promoted build, "unknown" is not acceptable and the Makefile says
+ * so loudly.
+ *
+ * Shape: "llama.cpp:<40-char sha>:clean" or ":dirty".
+ */
+const char *jl_runtime_build_id(void);
+
+const char *jl_llama_build(void);   /* deprecated alias for the above */
 
 /* ------------------------------------------------------------- status */
 

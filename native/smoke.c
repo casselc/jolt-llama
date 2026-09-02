@@ -137,7 +137,34 @@ int main(int argc, char **argv) {
     if (jl_state_load(sess, 1, blob, written, (int32_t) n_tok, &nread) != JL_ERR_SEQ_UNSUPPORTED) {
         fprintf(stderr, "FAIL: state load into nonzero seq accepted\n"); return 1;
     }
+    printf("runtime_build_id=%s\n", jl_runtime_build_id());
+    /* every seq-carrying entry point refuses a nonzero sequence */
+    {
+        size_t sz = 0;
+        if (jl_session_clear(sess, 1) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: clear accepted seq 1\n"); return 1; }
+        if (jl_session_clear(sess, -1) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: clear accepted seq -1 (clear-all is not a v0 concept)\n"); return 1; }
+        if (jl_state_size(sess, 1, &sz) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: state_size accepted seq 1\n"); return 1; }
+        if (jl_state_save(sess, 1, blob, n_state, &written) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: state_save accepted seq 1\n"); return 1; }
+    }
     printf("nonzero_seq=refused\n");
+
+    /* n_seq_max must be EXACTLY 1; zero was silently clamped before */
+    {
+        jl_session_params sp;
+        jl_session_params_default(&sp);
+        jl_session *tmp = NULL;
+        sp.n_seq_max = 0;
+        if (jl_session_new(model, &sp, &tmp) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: n_seq_max 0 accepted\n"); return 1; }
+        sp.n_seq_max = 2;
+        if (jl_session_new(model, &sp, &tmp) != JL_ERR_SEQ_UNSUPPORTED) {
+            fprintf(stderr, "FAIL: n_seq_max 2 accepted\n"); return 1; }
+        printf("seq_max_exactness=ok\n");
+    }
 
     /* APPEND-ONLY: only the current end is a legal pos0 */
     {

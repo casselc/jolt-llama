@@ -367,3 +367,129 @@ the reviewed SHA and the override was reverted.
 * **The 20-byte state format difference between builds** is recorded, not
   investigated. State is not claimed to be portable across llama.cpp builds,
   and the ABI/content checks now enforce that.
+
+---
+
+# v0 final correctness pass
+
+The last pass before freezing v0. Three P0 defects, two P1 contracts, and a
+documentation claim that was not true.
+
+## P0-1 — saved state was not bound to the llama.cpp build
+
+The promotion evidence already showed the same model serializing to 20263632
+bytes on one build and 20263652 on another, and then concluded that ABI plus
+model content id kept them apart. That was wrong. The shim can be byte-identical
+across two different llama.cpp trees, so:
+
+    same GGUF + same shim ABI + different llama.cpp  ->  state-compatible? said yes
+
+Saved state now carries `:runtime-id`, embedded in the shim at **build** time by
+`native/Makefile` from the `LLAMA_SRC` checkout — never discovered by shelling
+out to git during inference:
+
+    llama.cpp:b81c99b479d4c24e5eeca10de99032ebd343ef8f:clean
+
+`state-compatible?` checks it **separately from the ABI**, before any native
+call, and answers `:state/runtime-mismatch`. A tree that is not a git checkout
+yields `unknown:…`, which never matches; `make promote` refuses to build a
+library whose coordinate is unknown or dirty, so a promoted build cannot ship
+state it could not attribute.
+
+## P0-2 — single-sequence did not mean single-sequence
+
+Audited every entry point that accepts a sequence identity. Holes found and
+closed:
+
+| entry point | was | is |
+| --- | --- | --- |
+| `jl_session_new` | accepted `n_seq_max == 0` and clamped it to 1 | requires **exactly** 1 |
+| `jl_session_clear` | `seq_id < 0` meant "clear everything" | rejects any nonzero |
+| `jl_state_size` | no check | rejects any nonzero |
+| `jl_state_save` | no check | rejects any nonzero |
+| Jolt `clear!` | exposed `:seq-id` | no such option |
+| Jolt `save-state` | exposed `:seq-id` | no such option |
+
+Clamping 0 to 1 is the same class of lie as accepting 4: the caller's stated
+intent and the library's behaviour differ and nothing says so. And `-1` meaning
+"all sequences" is a multi-sequence concept smuggled into a single-sequence
+API — a caller passing it by accident got a *different operation* than the one
+they named.
+
+The public Jolt API no longer advertises a capability that does not exist.
+
+## P0-3 — candidate rewind accepted the wrong base
+
+`score-candidates` reads every candidate's **first** token from the logits the
+session is holding *now* (base A), then reaches later tokens by restoring the
+supplied state. Nothing checked that the state *was* A. Given a different but
+perfectly valid state B, the score mixed
+
+    P(t1 | A)   with   P(t2 | B, t1)
+
+a conditional that describes no sequence — and `state-compatible?` accepted B
+happily, because B is a good state for this model, runtime and ABI.
+
+Now required: `(= (:tokens state) @(:tokens session))`. **Equality, not prefix**
+— a strict prefix of the base is individually reusable as a checkpoint and still
+wrong here, because the tokens between it and the base would silently vanish
+from the conditional. Refused with `:score/base-state-mismatch` *before* any
+candidate touches native state.
+
+The ledger bug beside it is also fixed. The old code restored native state and
+then separately forced the token atom back to `base-tokens`, so if the two ever
+disagreed the ledger would confidently describe a sequence the session was not
+holding — and `load-state!`'s prefix check, the thing that would have caught it,
+reads that same ledger. Both sides now move through one operation.
+
+The single-token fast path is unchanged and asserted to stay that way: no saved
+state, no restore, no candidate evaluation, and each score equal to the direct
+base log-probability.
+
+## P1-4 — the hashes were named better than they are
+
+`:token-hash` and `:state-hash` were a 32-bit polynomial rolling value, and the
+state one only read the first 4096 bytes. Nothing about that is a content
+identity, and the earlier name (`sha256-hex`) implied one.
+
+**Option B, and it is forced rather than preferred.** A real SHA-256 over the
+blob needs a digest primitive; jolt-llama's core runs on stock Jolt with
+top-level `:deps {}`, and taking a crypto dependency to hash an in-process
+descriptor would trade the library's central property for an identity nothing
+yet persists. Renamed to `:token-check` / `:state-check`, with
+`:state/token-check-mismatch` and `:state/blob-check-mismatch`, and documented
+as **local integrity sentinels — not durable content identity**. When a state
+crosses a persistence or process boundary it needs a real digest, and that is
+the point at which to add one.
+
+## P1-5 — the v0 concurrency contract
+
+Handles are **thread-confined**: one session must not be evaluated from two
+threads at once, and this library does not claim concurrent inference safety.
+
+**Close is the deliberate exception**, because cleanup is where accidental
+concurrent calls actually happen — two `finally` blocks, a shutdown hook racing
+a worker. The handle carries a state atom moved only by `compare-and-set!`:
+
+    :open --CAS--> :closing --> :closed
+
+Only the thread that wins `:open -> :closing` calls native free. A boolean could
+not express this: read-then-write left a window where two threads both saw
+`false`, both wrote `true`, and both called free on one pointer.
+
+The native runtime refcount is **not** thread-safe and is not part of ordinary
+handle lifecycle — Jolt initialises the runtime once, on first model open, and
+never frees it. Stated rather than defended with a lock nothing needs yet.
+
+## The state compatibility coordinate, in full
+
+    { shim ABI version
+      native runtime build id      llama.cpp:<sha>:clean
+      model content SHA-256        of the GGUF, computed once at open
+      sequence id                  0 in v0
+      exact token vector           plus an integrity sentinel
+      native state byte count      plus a sampled integrity sentinel }
+
+Every one is checked **before** the native state load, because
+`llama_state_seq_set_data` given a foreign blob does not reliably fail — it can
+succeed into nonsense.

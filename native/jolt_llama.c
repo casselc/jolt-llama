@@ -91,11 +91,20 @@ static int g_runtime_refs = 0;
 
 int32_t jl_abi_version(void) { return JL_ABI_VERSION; }
 
-const char *jl_llama_build(void) {
-    static char buf[128];
-    snprintf(buf, sizeof(buf), "llama.cpp");
-    return buf;
-}
+#ifndef JL_LLAMA_BUILD_ID
+/*
+ * No coordinate was supplied at build time. Say so rather than inventing one:
+ * a state descriptor carrying a confident but wrong runtime id is worse than
+ * one carrying an honest "unknown", because the first passes a compatibility
+ * check it should have failed.
+ */
+#define JL_LLAMA_BUILD_ID "unknown:no-build-id-supplied"
+#endif
+
+const char *jl_runtime_build_id(void) { return JL_LLAMA_BUILD_ID; }
+
+/* Deprecated: kept so an older caller still links. Returns the same identity. */
+const char *jl_llama_build(void) { return jl_runtime_build_id(); }
 
 jl_status jl_runtime_init(void) {
     jl_clear_error();
@@ -245,8 +254,13 @@ jl_status jl_session_new(jl_model *model, const jl_session_params *params, jl_se
      * asked for 4 sequences and silently got 1 would build on an assumption the
      * token-identity contract cannot support.
      */
-    if (p.n_seq_max > 1) {
-        jl_set_error("jl_session_new: n_seq_max %u unsupported; v0 is single-sequence",
+    /*
+     * EXACTLY 1. Zero was previously accepted and silently clamped to 1 below,
+     * which is the same class of lie as accepting 4: the caller's stated
+     * intent and the library's behaviour differ, and nothing says so.
+     */
+    if (p.n_seq_max != 1) {
+        jl_set_error("jl_session_new: n_seq_max %u unsupported; v0 requires exactly 1",
                      p.n_seq_max);
         return JL_ERR_SEQ_UNSUPPORTED;
     }
@@ -309,12 +323,18 @@ uint32_t jl_session_n_ctx(const jl_session *session) {
 jl_status jl_session_clear(jl_session *session, int32_t seq_id) {
     jl_clear_error();
     if (!session || !session->ctx) { jl_set_error("jl_session_clear: null session"); return JL_ERR_INVALID_ARG; }
-    llama_memory_t mem = llama_get_memory(session->ctx);
-    if (seq_id < 0) {
-        llama_memory_clear(mem, true);
-    } else {
-        llama_memory_seq_rm(mem, seq_id, -1, -1);
+    /*
+     * Only sequence 0. The old code mapped seq_id < 0 to "clear everything",
+     * which is a multi-sequence concept smuggled into a single-sequence API --
+     * and under it a caller passing -1 by accident got a different operation
+     * than the one they named.
+     */
+    if (seq_id != 0) {
+        jl_set_error("jl_session_clear: seq_id %d unsupported; v0 is single-sequence (seq 0)", seq_id);
+        return JL_ERR_SEQ_UNSUPPORTED;
     }
+    llama_memory_t mem = llama_get_memory(session->ctx);
+    llama_memory_seq_rm(mem, 0, -1, -1);
     session->have_logits = 0;
     /* nothing resident means the next eval must start at 0 */
     session->n_resident = 0;
@@ -556,6 +576,10 @@ jl_status jl_token_logprob(jl_session *session, int32_t token, float *out) {
 
 jl_status jl_state_size(jl_session *session, int32_t seq_id, size_t *out) {
     jl_clear_error();
+    if (seq_id != 0) {
+        jl_set_error("jl_state_size: seq_id %d unsupported; v0 is single-sequence", seq_id);
+        return JL_ERR_SEQ_UNSUPPORTED;
+    }
     if (!session || !session->ctx || !out) { jl_set_error("jl_state_size: null arg"); return JL_ERR_INVALID_ARG; }
     *out = llama_state_seq_get_size(session->ctx, (llama_seq_id) seq_id);
     return JL_OK;
@@ -565,6 +589,10 @@ jl_status jl_state_save(jl_session *session, int32_t seq_id,
                         uint8_t *buf, size_t cap, size_t *n_out) {
     jl_clear_error();
     if (!session || !session->ctx || !n_out) { jl_set_error("jl_state_save: null arg"); return JL_ERR_INVALID_ARG; }
+    if (seq_id != 0) {
+        jl_set_error("jl_state_save: seq_id %d unsupported; v0 is single-sequence", seq_id);
+        return JL_ERR_SEQ_UNSUPPORTED;
+    }
     size_t need = llama_state_seq_get_size(session->ctx, (llama_seq_id) seq_id);
     *n_out = need;
     if (!buf) return JL_OK;                     /* sizing call */

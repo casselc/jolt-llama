@@ -495,14 +495,16 @@
               _ (llama/eval! state-session toks)
               st (llama/save-state state-session)
               which (h/draw! (g/sampled-from
-                              [:model :abi :seq :token-hash :blob-hash :blob-size :malformed]))
+                              [:model :abi :runtime :seq :token-check :blob-check
+                               :blob-size :malformed]))
               [bad expected]
               (case which
                 :model      [(assoc st :model-content-id "sha256:deadbeef") :state/model-mismatch]
                 :abi        [(assoc st :abi 99) :state/abi-mismatch]
                 :seq        [(assoc st :seq-id 1) :seq/unsupported]
-                :token-hash [(assoc st :token-hash "00000000") :state/token-hash-mismatch]
-                :blob-hash  [(assoc st :state-hash "00000000") :state/blob-hash-mismatch]
+                :runtime    [(assoc st :runtime-id "llama.cpp:0000:clean") :state/runtime-mismatch]
+                :token-check [(assoc st :token-check "00000000") :state/token-check-mismatch]
+                :blob-check  [(assoc st :state-check "00000000") :state/blob-check-mismatch]
                 :blob-size  [(assoc st :state-bytes 1) :state/blob-size-mismatch]
                 :malformed  [(dissoc st :tokens) :state/malformed])
               got (try (llama/load-state! state-session bad toks) :accepted
@@ -540,6 +542,231 @@
                 (finally (llama/close! s2))))
             (finally (llama/close! m2)))))))))
 
+
+;; ------------------------------------------------ sequence closed world
+
+(defn check-seq-closed-world! [runner]
+  (report/run!
+   runner
+   "every seq-carrying entry point refuses a nonzero sequence, without side effects"
+   (fn []
+     (h/run-test!
+      {:test-cases 40 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; A rejected call must not merely fail -- it must leave nothing behind.
+        ;; The public clear!/save-state no longer take a sequence at all, so the
+        ;; drawn ids exercise the two that still do plus the native floor.
+        (let [sq (h/draw! (g/sampled-from [-3 -1 1 2 17]))
+              s state-session
+              toks (vec (tok (probe-text 3)))]
+          (llama/clear! s)
+          (llama/eval! s toks)
+          (let [before-ledger @(:tokens s)
+                st (llama/save-state s)
+                refused (fn [f]
+                          (try (f) :ACCEPTED
+                               (catch Throwable e (:jolt.llama/error (ex-data e)))))
+                r-eval (refused #(llama/eval! s [1] {:seq-id sq}))
+                r-load (refused #(llama/load-state! s st toks {:seq-id sq}))]
+            (when-not (= :seq/unsupported r-eval)
+              (throw (ex-info "eval! accepted a nonzero seq"
+                              {:hegel/origin "seq/eval-refuses" :seq sq :got r-eval})))
+            (when-not (= :seq/unsupported r-load)
+              (throw (ex-info "load-state! accepted a nonzero seq"
+                              {:hegel/origin "seq/load-refuses" :seq sq :got r-load})))
+            ;; nothing moved
+            (when-not (= before-ledger @(:tokens s))
+              (throw (ex-info "a refused call changed the token ledger"
+                              {:hegel/origin "seq/refusal-has-no-effect"})))
+            ;; and the session still works
+            (when-not (pos? (count (llama/top-k s 3 {:pieces? false})))
+              (throw (ex-info "session unusable after a refused call"
+                              {:hegel/origin "seq/session-survives"}))))))))))
+
+(defn check-seq-max-exactness! [runner]
+  (report/run!
+   runner
+   "n_seq_max must be exactly 1, and a rejected session leaks nothing"
+   (fn []
+     (h/run-test!
+      {:test-cases 12 :database "" :verbosity :quiet}
+      (fn [_]
+        (let [n (h/draw! (g/sampled-from [0 2 4 32]))
+              m2 (llama/open-model {:path model-path})]
+          (try
+            (let [before @(:sessions m2)
+                  got (try (llama/new-session m2 {:context-size 256 :seq-max n})
+                           :ACCEPTED
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+              (when-not (= :seq/unsupported got)
+                (throw (ex-info "an illegal n_seq_max was accepted"
+                                {:hegel/origin "seq/seq-max-exact" :n n :got got})))
+              ;; a failed construction must not consume an ownership slot
+              (when-not (= before @(:sessions m2))
+                (throw (ex-info "a rejected session incremented the model's count"
+                                {:hegel/origin "seq/failed-new-consumes-no-count"})))
+              ;; and the model must still close cleanly, i.e. nothing leaked
+              (when-not (= :closed (llama/close! m2))
+                (throw (ex-info "model would not close after a rejected session"
+                                {:hegel/origin "seq/failed-new-leaks-nothing"}))))
+            (finally (try (llama/close! m2) (catch Throwable _ nil))))))))))
+
+;; -------------------------------------------------- candidate base state
+
+(defn check-scoring-base-must-be-exact! [runner]
+  (report/run!
+   runner
+   "multi-token scoring refuses any state that is not the exact current base"
+   (fn []
+     (h/run-test!
+      {:test-cases 10 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Every candidate's FIRST token is read from the logits the session
+        ;; holds now; its later tokens come from restoring the supplied state.
+        ;; If those are different bases the score mixes P(t1|A) with P(t2|B,t1),
+        ;; a conditional describing no sequence -- and state-compatible? accepts
+        ;; B happily, because B is a perfectly good state for this model.
+        (let [s state-session
+              n (h/draw! (g/integer 2 6))
+              toks (vec (tok (probe-text (+ 4 n))))
+              cut (h/draw! (g/integer 1 (max 1 (dec (count toks)))))
+              prefix (vec (take cut toks))]
+          ;; state SB, saved at a STRICT PREFIX of the base
+          (llama/clear! s)
+          (llama/eval! s prefix)
+          (let [sb (llama/save-state s)]
+            ;; now put the session at the full base A
+            (llama/clear! s)
+            (llama/eval! s toks)
+            (let [cands [{:id :a :tokens [(first toks) (second toks)]}]
+                  got (try (llama/score-candidates s cands {:state sb}) :ACCEPTED
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+              ;; PREFIX IS NOT ENOUGH: sb is individually reusable and still wrong here
+              (when-not (= :score/base-state-mismatch got)
+                (throw (ex-info "a non-base state was accepted for candidate rewind"
+                                {:hegel/origin "score/base-must-be-exact" :got got})))
+              ;; and the refusal happened before anything moved
+              (when-not (= toks @(:tokens s))
+                (throw (ex-info "a refused scoring call disturbed the session"
+                                {:hegel/origin "score/refusal-has-no-effect"})))))))))))
+
+(defn check-single-token-path-is-state-free! [runner]
+  (report/run!
+   runner
+   "single-token scoring needs no saved state and moves nothing"
+   (fn []
+     (h/run-test!
+      {:test-cases 10 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; The fast path must stay fast: one base distribution, no restore, no
+        ;; candidate evaluation. Asserted because it is easy to lose by accident
+        ;; while hardening the multi-token path beside it.
+        (let [s state-session
+              toks (vec (tok (probe-text 3)))
+              _ (llama/clear! s)
+              _ (llama/eval! s toks)
+              top (llama/top-k s 4 {:pieces? false})
+              cands (mapv (fn [t] {:id (:token t) :tokens [(:token t)]}) top)
+              before @(:tokens s)
+              ;; NO :state supplied at all
+              res (llama/score-candidates s cands)
+              after @(:tokens s)]
+          (when-not (= before after)
+            (throw (ex-info "the single-token path moved the token ledger"
+                            {:hegel/origin "score/single-token-is-state-free"})))
+          ;; and each score must equal the direct base log-probability
+          (doseq [c (:candidates res)]
+            (let [direct (llama/token-logprob s (:id c))]
+              (when-not (< (abs (- (double direct) (double (:logprob-sum c)))) 1e-6)
+                (throw (ex-info "a single-token score differs from the base logprob"
+                                {:hegel/origin "score/single-token-equals-base"})))))))))))
+
+(defn check-scoring-leaves-the-session-untouched! [runner]
+  (report/run!
+   runner
+   "after multi-token scoring the ledger and the native state still agree"
+   (fn []
+     (h/run-test!
+      {:test-cases 6 :database "" :verbosity :quiet}
+      (fn [_]
+        (let [s state-session
+              toks (vec (tok (probe-text 4)))
+              _ (llama/clear! s)
+              _ (llama/eval! s toks)
+              st (llama/save-state s)
+              top (llama/top-k s 3 {:pieces? false})
+              cands [{:id :one :tokens [(:token (first top))]}
+                     {:id :two :tokens [(:token (first top)) (:token (second top))]}]
+              _ (llama/score-candidates s cands {:state st})]
+          ;; the ledger says base
+          (when-not (= toks @(:tokens s))
+            (throw (ex-info "scoring left the ledger describing something else"
+                            {:hegel/origin "score/ledger-restored"})))
+          ;; and the NATIVE state agrees, proven by appending and comparing
+          ;; against a session that did the SAME appends without scoring.
+          ;;
+          ;; The oracle deliberately uses the same call structure -- eval base,
+          ;; then eval one token -- rather than a single prefill of base++token.
+          ;; A one-token append is below the calibrated 64-token threshold, so it
+          ;; legitimately differs from a one-pass recompute (docs/EXACTNESS.md);
+          ;; comparing against a prefill would fail for that reason and blame
+          ;; candidate scoring for it. The question here is only whether SCORING
+          ;; moved anything, so scoring is the only difference between the arms.
+          (let [t (:token (first top))]
+            (llama/eval! s [t])
+            (let [after-scoring (llama/top-k s 5 {:pieces? false})]
+              (llama/clear! s)
+              (llama/eval! s toks)
+              (llama/eval! s [t])
+              (let [oracle (llama/top-k s 5 {:pieces? false})
+                    d (apply max (map #(abs (- (double (:logprob %1)) (double (:logprob %2))))
+                                      after-scoring oracle))]
+                (when-not (zero? d)
+                  (throw (ex-info "native state drifted across candidate scoring"
+                                  {:hegel/origin "score/no-native-drift" :delta d}))))))))))))
+
+;; -------------------------------------------------------- concurrent close
+
+(defn check-concurrent-close-is-single! [runner]
+  (report/run!
+   runner
+   "N threads racing to close one handle produce exactly one native close"
+   (fn []
+     (h/run-test!
+      {:test-cases 6 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Cleanup is where accidental concurrent calls actually happen: two
+        ;; finally blocks, a shutdown hook racing a worker. The CAS is what
+        ;; makes exactly one of them call free.
+        (let [n (h/draw! (g/integer 2 8))
+              m2 (llama/open-model {:path model-path})
+              s (llama/new-session m2 {:context-size 256 :threads 2})
+              results (atom [])
+              latch (promise)
+              threads (doall (for [_ (range n)]
+                               (future (deref latch)
+                                       (swap! results conj
+                                              (try (llama/close! s)
+                                                   (catch Throwable e [:threw (ex-message e)]))))))]
+          (deliver latch true)
+          (doseq [t threads] (deref t))
+          (let [rs @results
+                closed (count (filter #{:closed} rs))
+                already (count (filter #{:already-closed} rs))]
+            (when-not (= 1 closed)
+              (throw (ex-info "not exactly one thread closed the session"
+                              {:hegel/origin "close/exactly-one" :results rs})))
+            (when-not (= n (+ closed already))
+              (throw (ex-info "a racing close neither closed nor reported already-closed"
+                              {:hegel/origin "close/defined-result" :results rs})))
+            ;; the ownership count must not have gone negative or double-decremented
+            (when-not (= 0 @(:sessions m2))
+              (throw (ex-info "the model's session count is wrong after a close race"
+                              {:hegel/origin "close/count-exact" :n @(:sessions m2)})))
+            (when-not (= :closed (llama/close! m2))
+              (throw (ex-info "model would not close after its session race"
+                              {:hegel/origin "close/model-after-race"}))))))))))
+
 ;; ----------------------------------------------------------------- main
 
 (defn -main [& _]
@@ -557,6 +784,18 @@
     (check-use-after-close-is-refused! runner)
     (check-v0-is-single-sequence! runner)
     (check-eval-is-append-only! runner)
+
+    (println "--- sequence closed world ---")
+    (check-seq-closed-world! runner)
+    (check-seq-max-exactness! runner)
+
+    (println "--- candidate base state ---")
+    (check-scoring-base-must-be-exact! runner)
+    (check-single-token-path-is-state-free! runner)
+    (check-scoring-leaves-the-session-untouched! runner)
+
+    (println "--- concurrent close ---")
+    (check-concurrent-close-is-single! runner)
 
     (println "--- state compatibility ---")
     (check-incompatible-state-is-refused! runner)

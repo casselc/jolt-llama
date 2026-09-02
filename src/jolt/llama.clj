@@ -42,6 +42,7 @@
 ;; ---------------------------------------------------------------- foreign
 
 (ffi/defcfn ^:private c-abi-version "jl_abi_version" [] :int32)
+(ffi/defcfn ^:private c-runtime-build-id "jl_runtime_build_id" [] :pointer)
 (ffi/defcfn ^:private c-last-error "jl_last_error" [:pointer :size_t] :size_t)
 
 (ffi/defcfn ^:private c-runtime-init "jl_runtime_init" [] :int32)
@@ -128,6 +129,21 @@
   2)
 
 (defn abi-version [] (c-abi-version))
+
+(defn runtime-build-id
+  "Identity of the native runtime that will serialize this session's state.
+
+  Embedded in the shim at BUILD time, e.g.
+  \"llama.cpp:b81c99b479d4c24e5eeca10de99032ebd343ef8f:clean\". Not decoration:
+  the same model serialized to 20263632 bytes on one llama.cpp build and
+  20263652 on another, so native state is NOT portable across builds -- and the
+  shim ABI cannot stand in for that, since the shim can be byte-identical
+  across two different llama.cpp trees.
+
+  A build with no coordinate reports \"unknown:...\", which never matches
+  anything, so an unattributable state is refused rather than trusted."
+  []
+  (ffi/ptr->string (c-runtime-build-id)))
 
 (defn- ensure-abi! []
   (let [got (c-abi-version)]
@@ -239,11 +255,13 @@
            ;; keeps the authoritative count; this mirror exists so the Jolt
            ;; error can name them before the call is made.
            :sessions (atom 0)
-           :closed (atom false)})))))
+           ;; :open -> :closing -> :closed, moved only by compare-and-set!.
+           ;; See close! for why a boolean was not enough.
+           :state (atom :open)})))))
 
 (defn- model-ptr [m]
   (when-not (and (map? m) (= :model (::kind m))) (throw (ex-info "not a model handle" {:got m})))
-  (when @(:closed m) (throw (ex-info "jolt.llama: model is closed"
+  (when (not= :open @(:state m)) (throw (ex-info "jolt.llama: model is closed"
                                      {:jolt.llama/op :model-use
                                       :jolt.llama/error :handle/closed})))
   (::ptr m))
@@ -288,23 +306,27 @@
            ;; The token vector currently resident in seq 0. This is the Jolt-side
            ;; half of the token-identity contract; the C layer has no opinion.
            :tokens (atom [])
-           :closed (atom false)})))))
+           :state (atom :open)})))))
 
 (defn- session-ptr [s]
   (when-not (and (map? s) (= :session (::kind s))) (throw (ex-info "not a session handle" {:got s})))
-  (when @(:closed s) (throw (ex-info "jolt.llama: session is closed"
+  (when (not= :open @(:state s)) (throw (ex-info "jolt.llama: session is closed"
                                      {:jolt.llama/op :session-use
                                       :jolt.llama/error :handle/closed})))
   (::ptr s))
 
 (defn clear!
-  "Drop cached state for a sequence and forget its token vector."
-  ([session] (clear! session 0))
-  ([session seq-id]
-   (let [p (session-ptr session)]
-     (check! (c-session-clear p (int seq-id)) :session-clear {})
-     (reset! (:tokens session) [])
-     :ok)))
+  "Drop the session's cached state and forget its token vector.
+
+  No :seq-id option. v0 is single-sequence, so the only legal value was 0 and
+  advertising the parameter offered a capability that did not exist -- a caller
+  passing -1 used to get a clear-everything operation, a multi-sequence concept,
+  instead of an error."
+  [session]
+  (let [p (session-ptr session)]
+    (check! (c-session-clear p 0) :session-clear {})
+    (reset! (:tokens session) [])
+    :ok))
 
 ;; ----------------------------------------------------------------- tokenize
 
@@ -430,16 +452,34 @@
 
 ;; -------------------------------------------------------------------- state
 
-(defn- digest-seq
-  "Content hash for provenance. Falls back to a cheap stable digest when no
-  crypto is available, since this identifies a state to us, not to the world."
+(defn- sentinel-seq
+  "A cheap stable CHECK value over a sequence. NOT a content hash.
+
+  Named as a sentinel because that is what it is: a 32-bit polynomial rolling
+  value that detects accidental corruption and casual mutation, and would not
+  survive an adversary or serve as a content address. The earlier name
+  (sha256-hex, then digest-*) implied cryptographic identity this does not have.
+
+  Option B of the v0 integrity choice, and it is forced rather than preferred:
+  a real SHA-256 over the state blob would need a digest primitive, jolt-llama's
+  core runs on stock Jolt with top-level :deps {}, and taking a crypto
+  dependency to hash an in-process descriptor would trade the library's central
+  property for an identity nothing yet persists. When a state crosses a
+  persistence or process boundary it needs a real digest, and that is the point
+  at which to add one."
   [xs]
   (let [h (reduce (fn [acc b] (unchecked-int (+ (* 31 acc) (bit-and b 0xff))))
                   (int 17) xs)]
     (format "%08x" (bit-and h 0xffffffff))))
 
-(defn- digest-array
-  "The same digest over the first `n` bytes of an array, WITHOUT seqing it.
+(defn- sentinel-array
+  "The same sentinel over the first `n` bytes of an array, WITHOUT seqing it.
+
+  SAMPLED, and therefore weaker still: it reads a bounded prefix, so a mutation
+  past that prefix is invisible to it. Paired with the exact byte count, which
+  catches truncation and extension, it is enough to notice a descriptor that has
+  been accidentally mixed up or damaged -- and it is not enough to call a state
+  content-addressed, which is why nothing here does.
 
   `(reduce f init (take 4096 blob))` looks equivalent and is not: taking a seq
   over a 54 MB byte array walks the whole array before `take` sees its first
@@ -461,8 +501,10 @@
   count, and the model coordinate. The raw blob is held in memory here; a
   content-addressed store is a later concern."
   ([session] (save-state session {}))
-  ([session {:keys [seq-id] :or {seq-id 0}}]
-   (let [p (session-ptr session)
+  ([session _opts]
+   ;; no :seq-id option: v0 is single-sequence and 0 was the only legal value
+   (let [seq-id 0
+         p (session-ptr session)
          toks @(:tokens session)]
      (ffi/with-out [np :size_t]
        (check! (c-state-save p (int seq-id) ffi/null 0 np) :state-save {})
@@ -478,15 +520,19 @@
               ;; and are explicitly NOT trusted -- a path can point at different
               ;; bytes between runs and descriptions collide across
               ;; quantizations of the same model.
+              ;; the NATIVE RUNTIME that produced this blob. The model and the
+              ;; ABI together do not identify it: two llama.cpp builds behind
+              ;; one shim ABI serialize different bytes.
+              :runtime-id (runtime-build-id)
               :model-content-id (get-in session [:model :content-id])
               :model-desc (get-in session [:model :desc])
               :model-path (get-in session [:model :path])
               :seq-id seq-id
               :tokens toks
               :n-tokens (count toks)
-              :token-hash (digest-seq (map int toks))
+              :token-check (sentinel-seq (map int toks))
               :state-bytes written
-              :state-hash (digest-array blob 4096)
+              :state-check (sentinel-array blob 4096)
               :abi (c-abi-version)
               ::blob blob})))))))
 
@@ -523,11 +569,14 @@
       (not (vector? (:tokens state)))          :state/malformed
       (not= (:n-tokens state) (count (:tokens state))) :state/malformed
       (not= (:abi state) abi-expected)         :state/abi-mismatch
+      ;; distinct from the ABI check on purpose: the shim can be byte-identical
+      ;; across two llama.cpp trees that serialize state differently
+      (not= (:runtime-id state) (runtime-build-id)) :state/runtime-mismatch
       (not= 0 (:seq-id state))                 :seq/unsupported
-      (not= (:token-hash state) (digest-seq (map int (:tokens state))))
-      :state/token-hash-mismatch
-      (not= (:state-hash state) (digest-array (::blob state) 4096))
-      :state/blob-hash-mismatch
+      (not= (:token-check state) (sentinel-seq (map int (:tokens state))))
+      :state/token-check-mismatch
+      (not= (:state-check state) (sentinel-array (::blob state) 4096))
+      :state/blob-check-mismatch
       (not= (:state-bytes state) (alength ^bytes (::blob state)))
       :state/blob-size-mismatch
       (not= (:model-content-id state) (:content-id model))
@@ -570,8 +619,8 @@
     :state/prefix-mismatch      the saved tokens do not prefix `tokens`
     :state/model-mismatch       saved against a different model artifact
     :state/abi-mismatch         saved by a different shim ABI
-    :state/token-hash-mismatch  the descriptor's tokens were altered
-    :state/blob-hash-mismatch   the descriptor's blob was altered
+    :state/token-check-mismatch  the descriptor's tokens were altered
+    :state/blob-check-mismatch   the descriptor's blob was altered
     :state/blob-size-mismatch   the descriptor disagrees with its own blob
     :state/malformed            not a state descriptor
     :seq/unsupported            v0 is single-sequence
@@ -645,11 +694,11 @@
   ([session prefix suffix {:keys [k seq-id] :or {k 50 seq-id 0}}]
    (let [prefix (vec prefix) suffix (vec suffix)
          full   (into prefix suffix)
-         _      (clear! session seq-id)
+         _      (clear! session)
          _      (eval! session full {:seq-id seq-id})
          one    (top-k session k {:pieces? false})
          one-m  (into {} (map (juxt :token :logprob) one))
-         _      (clear! session seq-id)
+         _      (clear! session)
          _      (eval! session prefix {:seq-id seq-id})
          _      (eval! session suffix {:seq-id seq-id})
          two    (top-k session k {:pieces? false})
@@ -796,6 +845,33 @@
                                   "need :state so the base can be restored between them")
                              {:jolt.llama/op :score-candidates
                               :jolt.llama/error :error/invalid-arg})))
+         ;; THE SAVED STATE MUST BE THIS EXACT BASE, not merely a compatible
+         ;; one. Every candidate's FIRST token is read from the logits the
+         ;; session is holding right now (base A); its later tokens are reached
+         ;; by restoring `state` and advancing. If `state` were some other valid
+         ;; checkpoint B, the score would mix P(t1 | A) with P(t2 | B, t1) --
+         ;; a conditional that describes no sequence at all, and one that
+         ;; state-compatible? happily accepts because B is a perfectly good
+         ;; state for this model, runtime and ABI.
+         ;;
+         ;; Equality, not prefix: a strict prefix of the base is individually
+         ;; reusable as a checkpoint and still wrong here, because the tokens
+         ;; between it and the base would silently vanish from the conditional.
+         ;;
+         ;; Checked BEFORE any candidate touches native state, so a refusal
+         ;; leaves the session exactly as it was found.
+         _ (when (and multi? (not= (vec (:tokens state)) (vec base-tokens)))
+             (throw (ex-info (str "jolt.llama/score-candidates: :state is not the current "
+                                  "scoring base; candidate rewind needs the exact base")
+                             {:jolt.llama/op :score-candidates
+                              :jolt.llama/error :score/base-state-mismatch
+                              :jolt.llama/base-n base-n
+                              :jolt.llama/state-n (count (:tokens state))
+                              :jolt.llama/diverges-at
+                              (or (first (keep-indexed
+                                          (fn [i [a b]] (when (not= a b) i))
+                                          (map vector (:tokens state) base-tokens)))
+                                  (min (count (:tokens state)) base-n))})))
          ;; One read of the base distribution serves every candidate's first
          ;; token. Doing this before any restore is what keeps the single-token
          ;; path free of evaluation.
@@ -838,11 +914,19 @@
                      (sort-by :logprob-sum >)
                      (map-indexed (fn [i c] (assoc c :rank i)))
                      vec)]
-     ;; Leave the session as we found it. Only needed if a multi-token candidate
-     ;; advanced the sequence.
-     (when (and multi? state)
+     ;; Leave the session as we found it, through ONE operation that moves the
+     ;; native state and the token ledger together. The previous code restored
+     ;; native state and then separately forced the ledger back to base-tokens,
+     ;; so if the two ever disagreed the ledger would confidently describe a
+     ;; sequence the session was not holding -- and load-state!'s prefix check,
+     ;; the thing that would have caught it, reads that same ledger.
+     ;;
+     ;; Safe to drop the manual swap because state.tokens == base-tokens is
+     ;; enforced above, and load-state! sets the ledger from the state it
+     ;; restored. Only needed at all if a multi-token candidate advanced the
+     ;; sequence; the single-token path never moves native state.
+     (when multi?
        (load-state! session state (:tokens state) {:seq-id seq-id}))
-     (swap! (:tokens session) (fn [_] base-tokens))
      {:candidates ranked
       :best (first ranked)
       :n-candidates (count ranked)
@@ -857,47 +941,70 @@
 ;; ------------------------------------------------------------------- close
 
 (defn close!
-  "Close a session or model.
+  "Close a session or model. Returns :closed, :already-closed, or throws.
 
-  Idempotent for a handle this wrapper owns: closing twice returns
-  :already-closed rather than throwing, because a cleanup path that throws on a
-  double close makes correct unwinding harder than it needs to be. That
-  idempotence lives HERE and cannot be pushed into C -- once jl_session_close
-  has freed the struct, a second raw call reads freed memory before it can
-  check anything.
+  CONCURRENCY CONTRACT, v0. Handles are otherwise THREAD-CONFINED: one session
+  must not be evaluated from two threads at once, and this library does not
+  claim concurrent inference safety. CLOSE is the deliberate exception, hardened
+  because cleanup is exactly where accidental concurrent calls happen -- two
+  finally blocks, a shutdown hook racing a worker.
 
-  Closing a model with live sessions THROWS :model/sessions-active. The
-  sessions are not closed on the caller's behalf: a handle this function did
-  not create is not its to invalidate, and silently closing children would turn
-  one caller's mistake into another caller's dangling handle. The shim refuses
-  independently with JL_ERR_SESSIONS_ACTIVE."
+  The handle carries :state, moved only by compare-and-set!:
+
+      :open --CAS--> :closing --> :closed
+
+  Only the thread that wins :open -> :closing calls native free. Every other
+  caller observes :closing or :closed and returns :already-closed without
+  touching the pointer. A boolean could not express this: read-then-write left
+  a window where two threads both saw false, both wrote true, and both called
+  free on one pointer.
+
+  This is idempotence that CANNOT live in C. Once jl_session_close has freed the
+  struct a second raw call reads freed memory before it can check anything, so
+  the guard has to sit above the pointer -- which is what this atom is.
+
+  Closing a model with live sessions THROWS :model/sessions-active and leaves
+  the model :open and fully usable. Child sessions are never closed on the
+  caller's behalf: a handle this function did not create is not its to
+  invalidate.
+
+  The native runtime refcount is NOT thread-safe and is not part of ordinary
+  handle lifecycle -- Jolt initialises the runtime once, on first model open,
+  and never frees it. That is the v0 contract, stated rather than defended with
+  a lock nobody needs yet."
   [handle]
-  (cond
-    (not (map? handle)) (throw (ex-info "jolt.llama/close!: not a handle" {:got handle}))
-    @(:closed handle) :already-closed
-    :else
-    (let [k (::kind handle)]
+  (if-not (map? handle)
+    (throw (ex-info "jolt.llama/close!: not a handle" {:got handle}))
+    (let [k (::kind handle)
+          st (:state handle)]
       (case k
         :session
-        (do (reset! (:closed handle) true)
-            (check! (c-session-close (::ptr handle)) :session-close {})
-            (when-let [live (:sessions (:model handle))] (swap! live dec)))
+        (if-not (compare-and-set! st :open :closing)
+          :already-closed
+          (do (check! (c-session-close (::ptr handle)) :session-close {})
+              ;; released only by the thread that actually closed, so the
+              ;; model's count can never go negative or be decremented twice
+              (when-let [live (:sessions (:model handle))] (swap! live dec))
+              (reset! st :closed)
+              :closed))
 
         :model
+        ;; the live-session check happens BEFORE the CAS, so a refused close
+        ;; leaves the model :open rather than stranded in :closing
         (let [live (if-let [a (:sessions handle)] @a 0)]
           (when (pos? live)
-            ;; checked BEFORE marking closed, so a refused close leaves the
-            ;; model exactly as usable as it was
             (throw (ex-info (str "jolt.llama/close!: " live " session(s) still open; "
                                  "close them before the model")
                             {:jolt.llama/op :model-close
                              :jolt.llama/error :model/sessions-active
                              :jolt.llama/sessions live})))
-          (reset! (:closed handle) true)
-          (check! (c-model-close (::ptr handle)) :model-close {}))
+          (if-not (compare-and-set! st :open :closing)
+            :already-closed
+            (do (check! (c-model-close (::ptr handle)) :model-close {})
+                (reset! st :closed)
+                :closed)))
 
-        (throw (ex-info "jolt.llama/close!: unknown handle kind" {:kind k})))
-      :closed)))
+        (throw (ex-info "jolt.llama/close!: unknown handle kind" {:kind k}))))))
 
 (defmacro with-model
   "(with-model [m {:path ...}] body) — closes on normal or exceptional exit."
