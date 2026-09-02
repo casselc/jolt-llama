@@ -167,6 +167,14 @@ struct jl_model {
 
 struct jl_session {
     struct llama_context *ctx;
+    /*
+     * TEST-ONLY. When positive, jl_eval treats the decode of the Nth chunk as
+     * having failed, so the partial-failure path can be exercised without
+     * waiting for a real llama_decode error. Only jl_test_fail_after_chunk
+     * sets it, it is never set by ordinary use, and it is cleared once it
+     * fires so a single call injects a single failure.
+     */
+    int32_t               test_fail_chunk;
     jl_model             *model;
     /*
      * Tokens resident in sequence 0, maintained here rather than trusted from
@@ -286,6 +294,22 @@ jl_status jl_model_open(const char *path, const jl_model_params *params, jl_mode
     h->path  = strdup(path);
 
     *out = h;
+    return JL_OK;
+}
+
+/*
+ * TEST-ONLY fault injection. Arrange for the decode of chunk `n` (1-based) to
+ * be reported as failed on the next jl_eval, so the partial-failure and
+ * poisoning path is reachable from a test. Passing 0 disables it.
+ *
+ * Exported rather than hidden behind a compile flag so the shipped library is
+ * the one under test -- a fault path that only exists in a special build is a
+ * fault path nobody has exercised.
+ */
+jl_status jl_test_fail_after_chunk(jl_session *session, int32_t n) {
+    jl_clear_error();
+    if (!session) { jl_set_error("jl_test_fail_after_chunk: null session"); return JL_ERR_INVALID_ARG; }
+    session->test_fail_chunk = n;
     return JL_OK;
 }
 
@@ -587,7 +611,13 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
         }
         batch.n_tokens = (int32_t) chunk;
 
-        int32_t rc = llama_decode(session->ctx, batch);
+        int32_t rc;
+        if (session->test_fail_chunk > 0 && (int32_t) (ci + 1) == session->test_fail_chunk) {
+            session->test_fail_chunk = 0;   /* one injected failure per request */
+            rc = -1;
+        } else {
+            rc = llama_decode(session->ctx, batch);
+        }
         llama_batch_free(batch);
         if (rc != 0) {
             session->have_logits = 0;
@@ -758,6 +788,20 @@ jl_status jl_state_load(jl_session *session, int32_t seq_id,
     }
     size_t got = llama_state_seq_set_data(session->ctx, buf, len, (llama_seq_id) seq_id);
     if (got == 0) { jl_set_error("llama_state_seq_set_data rejected %zu bytes", len); return JL_ERR_STATE; }
+    /*
+     * The WHOLE blob must be consumed. A short read means llama.cpp stopped
+     * early and the trailing bytes describe something it did not restore --
+     * partially applied state that would otherwise be reported as success,
+     * with the token ledger then claiming a sequence the context only half
+     * holds. A long read is not possible but is checked with the same
+     * comparison rather than assumed.
+     */
+    if (got != len) {
+        session->poisoned = 1;
+        jl_set_error("jl_state_load: consumed %zu of %zu bytes; state partially "
+                     "applied, session is poisoned", got, len);
+        return JL_ERR_STATE;
+    }
     *n_read = got;
     /*
      * A restored sequence has no logits until something is evaluated on top of

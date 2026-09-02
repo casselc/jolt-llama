@@ -220,6 +220,66 @@ int main(int argc, char **argv) {
         printf("append_only=ok\n");
     }
 
+    /*
+     * PARTIAL EVAL FAILURE. jl_eval walks several chunks and only updates
+     * n_resident once all of them succeed, so a failure in a later chunk leaves
+     * earlier ones already applied to the context while the ledger still
+     * describes the state before the call. The session must poison itself
+     * rather than hand back a handle whose ledger and context disagree.
+     *
+     * A tiny n_batch makes a short prompt chunk, so the path is reachable
+     * without a 2048-token input.
+     */
+    {
+        jl_session_params sp;
+        jl_session_params_default(&sp);
+        sp.n_ctx = 512; sp.n_batch = 2; sp.n_ubatch = 2; sp.n_seq_max = 1;
+        sp.n_threads = 2; sp.n_threads_batch = 2;
+        jl_session *ps = NULL;
+        if (jl_session_new(model, &sp, &ps) != JL_OK) {
+            fprintf(stderr, "FAIL: could not build the fault-injection session\n"); return 1; }
+
+        /* fail the SECOND chunk, so the first has already touched the context */
+        if (jl_test_fail_after_chunk(ps, 2) != JL_OK) {
+            fprintf(stderr, "FAIL: could not arm fault injection\n"); return 1; }
+        if (jl_eval(ps, 0, toks, n_tok, 0) != JL_ERR_DECODE) {
+            fprintf(stderr, "FAIL: injected decode failure was not reported\n"); return 1; }
+
+        /* the session must now refuse to be used */
+        size_t psz = 0;
+        if (jl_eval(ps, 0, toks, 1, jl_session_n_resident(ps)) != JL_ERR_POISONED) {
+            fprintf(stderr, "FAIL: a poisoned session accepted an eval\n"); return 1; }
+        if (jl_state_save(ps, 0, NULL, 0, &psz) != JL_ERR_POISONED) {
+            fprintf(stderr, "FAIL: a poisoned session accepted a state save\n"); return 1; }
+
+        /* clear is the documented recovery, and it must work */
+        if (jl_session_clear(ps, 0) != JL_OK) {
+            fprintf(stderr, "FAIL: clear did not recover a poisoned session\n"); return 1; }
+        if (jl_eval(ps, 0, toks, n_tok, 0) != JL_OK) {
+            fprintf(stderr, "FAIL: session unusable after clearing the poison\n"); return 1; }
+        if (jl_session_n_resident(ps) != (int32_t) n_tok) {
+            fprintf(stderr, "FAIL: resident count wrong after recovery\n"); return 1; }
+
+        jl_session_close(ps);
+        printf("partial_eval_failure=poisoned_then_recovered\n");
+    }
+
+    /*
+     * A short state load must be refused, not reported as success. Feeding
+     * jl_state_load fewer bytes than the blob is the shape a truncated or
+     * partially-written descriptor takes.
+     */
+    {
+        size_t nr = 0;
+        jl_status tst = jl_state_load(sess, 0, blob, written / 2, (int32_t) n_tok, &nr);
+        if (tst == JL_OK) {
+            fprintf(stderr, "FAIL: a truncated state blob was accepted\n"); return 1; }
+        printf("truncated_state_load=refused(%d)\n", (int) tst);
+        /* that poisons the session by design; clear to continue */
+        jl_session_clear(sess, 0);
+        jl_eval(sess, 0, toks, n_tok, 0);
+    }
+
     printf("negative_paths=ok\n");
 
     free(blob); free(toks);

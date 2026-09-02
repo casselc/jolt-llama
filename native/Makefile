@@ -41,14 +41,29 @@ else
 endif
 CFLAGS  += -DJL_LLAMA_BUILD_ID=\"$(JL_BUILD_ID)\"
 
-# A promoted build must not ship an unknown coordinate. `make promote` fails
-# rather than producing a library whose saved state cannot be attributed.
+# A promoted build must not ship an unknown coordinate, AND must be the llama.cpp
+# the promotion evidence names. Accepting any clean SHA would happily promote a
+# clean build of the wrong tree -- a gate that checks tidiness rather than
+# identity.
+#
+#   make promote EXPECTED_LLAMA_SHA=<40 hex> LLAMA_SRC=... LLAMA_LIB=...
+#
+# EXPECTED_LLAMA_SHA is REQUIRED. Defaulting it to the current checkout would
+# make the check compare a value with itself.
 .PHONY: promote
 promote:
+	@if [ -z "$(EXPECTED_LLAMA_SHA)" ]; then \
+	  echo "REFUSING: set EXPECTED_LLAMA_SHA to the pinned llama.cpp commit" >&2; exit 1; \
+	fi
 	@case "$(JL_BUILD_ID)" in \
-	  llama.cpp:*:clean) echo "build id: $(JL_BUILD_ID)";; \
+	  llama.cpp:*:clean) : ;; \
 	  *) echo "REFUSING: build id is '$(JL_BUILD_ID)', not a clean pinned llama.cpp" >&2; exit 1;; \
 	esac
+	@if [ "$(LLAMA_SHA)" != "$(EXPECTED_LLAMA_SHA)" ]; then \
+	  echo "REFUSING: LLAMA_SRC is at $(LLAMA_SHA)," >&2; \
+	  echo "          but the promotion expects $(EXPECTED_LLAMA_SHA)" >&2; exit 1; \
+	fi
+	@echo "build id: $(JL_BUILD_ID)"
 	@$(MAKE) all
 INCS     = -I. -I$(LLAMA_SRC)/include -I$(LLAMA_SRC)/ggml/include
 LIBS     = -L$(LLAMA_LIB) -lllama -lggml -lggml-base -Wl,-rpath,$(LLAMA_LIB)

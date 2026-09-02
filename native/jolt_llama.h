@@ -238,6 +238,14 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
  */
 jl_status jl_sha256_hex(const uint8_t *data, size_t len, char *out, size_t cap);
 
+/*
+ * TEST-ONLY. Make the decode of chunk `n` (1-based) report failure on the next
+ * jl_eval, so the partial-failure and poisoning path can be exercised. 0
+ * disables. Exported rather than hidden behind a build flag, so the library
+ * under test is the library that ships.
+ */
+jl_status jl_test_fail_after_chunk(jl_session *session, int32_t n);
+
 /* Tokens currently resident in the session, i.e. the only legal pos0. */
 int32_t jl_session_n_resident(const jl_session *session);
 
