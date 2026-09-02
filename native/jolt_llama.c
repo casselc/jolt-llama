@@ -309,6 +309,16 @@ jl_status jl_model_open(const char *path, const jl_model_params *params, jl_mode
 jl_status jl_test_fail_after_chunk(jl_session *session, int32_t n) {
     jl_clear_error();
     if (!session) { jl_set_error("jl_test_fail_after_chunk: null session"); return JL_ERR_INVALID_ARG; }
+    /*
+     * Exported so the library under test is the library that ships, but ARMING
+     * it takes a deliberate opt-in. Without this any consumer holding a session
+     * pointer could inject a decode failure -- not a memory-safety hole, but an
+     * availability one, and nothing legitimate arms it.
+     */
+    if (!getenv("JL_ENABLE_TEST_HOOKS")) {
+        jl_set_error("jl_test_fail_after_chunk: set JL_ENABLE_TEST_HOOKS=1 to arm fault injection");
+        return JL_ERR_INVALID_ARG;
+    }
     session->test_fail_chunk = n;
     return JL_OK;
 }
@@ -746,6 +756,10 @@ jl_status jl_state_size(jl_session *session, int32_t seq_id, size_t *out) {
         jl_set_error("jl_state_size: seq_id %d unsupported; v0 is single-sequence", seq_id);
         return JL_ERR_SEQ_UNSUPPORTED;
     }
+    if (session && session->poisoned) {
+        jl_set_error("jl_state_size: session is poisoned; clear or close it");
+        return JL_ERR_POISONED;
+    }
     if (!session || !session->ctx || !out) { jl_set_error("jl_state_size: null arg"); return JL_ERR_INVALID_ARG; }
     *out = llama_state_seq_get_size(session->ctx, (llama_seq_id) seq_id);
     return JL_OK;
@@ -785,6 +799,17 @@ jl_status jl_state_load(jl_session *session, int32_t seq_id,
     if (n_tokens < 0) {
         jl_set_error("jl_state_load: n_tokens %d is negative", n_tokens);
         return JL_ERR_INVALID_ARG;
+    }
+    /*
+     * The header promises a poisoned session refuses everything but clear and
+     * close. It was only enforced in jl_eval and jl_state_save, so a load could
+     * still mutate a context whose ledger and state already disagree -- the
+     * contract was broader than the code. Restoring is not recovery: only
+     * jl_session_clear reconciles the two.
+     */
+    if (session->poisoned) {
+        jl_set_error("jl_state_load: session is poisoned; clear or close it");
+        return JL_ERR_POISONED;
     }
     size_t got = llama_state_seq_set_data(session->ctx, buf, len, (llama_seq_id) seq_id);
     if (got == 0) { jl_set_error("llama_state_seq_set_data rejected %zu bytes", len); return JL_ERR_STATE; }

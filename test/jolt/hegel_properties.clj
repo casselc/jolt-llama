@@ -41,26 +41,38 @@
 (defn check-canonical-prefix-holds! [runner]
   (report/run!
    runner
-   "computed token boundary is a true prefix of every extension"
+   "the computed boundary is exactly what load-state! will accept"
    (fn []
      (h/run-test!
       {:test-cases 150 :database "" :verbosity :quiet}
       (fn [_]
-        ;; A stable spine and an arbitrary dynamic suffix. The CONTRACT is not
-        ;; that the spine's own tokenization is a prefix -- it is that the
-        ;; boundary jolt.llama computes is one.
+        ;; REWRITTEN after review. The earlier version computed n as the common
+        ;; prefix length and then asserted that the first n tokens agreed -- true
+        ;; by construction, so it could not fail and proved nothing.
+        ;;
+        ;; The claim worth testing is that the boundary this library computes is
+        ;; the one its own gate accepts, and that ONE MORE token is not. That
+        ;; can fail: it ties the arithmetic to token-prefix-ok?, which is what
+        ;; load-state! actually consults.
         (let [stable (str "CONTROLLER POLICY\nsvc"
                           (h/draw! (g/integer 0 999))
                           ": budget=" (h/draw! (g/integer 1 9999)) "ms\nSTATE\n")
               suffix (h/draw! (g/string {:max-size 24}))
-              full   (tok (str stable suffix))
-              spine  (tok stable)
-              n      (common-prefix-len spine full)]
-          ;; the computed boundary must be a genuine token prefix
-          (when-not (= (vec (take n spine)) (vec (take n full)))
-            (throw (ex-info "computed boundary is not a token prefix"
-                            {:hegel/origin "seam/computed-boundary-is-prefix"})))
-          ;; and it must never exceed either sequence
+              full   (vec (tok (str stable suffix)))
+              spine  (vec (tok stable))
+              n      (count (take-while true? (map = spine full)))
+              at-n   {:tokens (vec (take n spine))}]
+          ;; the boundary is accepted
+          (when-not (llama/token-prefix-ok? at-n full)
+            (throw (ex-info "the computed boundary was rejected by the gate"
+                            {:hegel/origin "seam/boundary-accepted" :n n})))
+          ;; and one token past it is NOT, whenever there is one to take
+          (when (< n (count spine))
+            (let [past {:tokens (vec (take (inc n) spine))}]
+              (when (llama/token-prefix-ok? past full)
+                (throw (ex-info "a token PAST the boundary was accepted"
+                                {:hegel/origin "seam/past-boundary-rejected" :n n})))))
+          ;; and the boundary never exceeds either sequence
           (when (or (> n (count spine)) (> n (count full)))
             (throw (ex-info "boundary exceeds a sequence"
                             {:hegel/origin "seam/boundary-in-range"})))))))))
@@ -277,11 +289,15 @@
         ;; The stronger claim, asserted only where calibration says it holds.
         ;; This is the exact-spine result M1 reports, with its precondition made
         ;; explicit instead of implied by the shape of the test data.
+        ;; The fixture is sized so the body ALWAYS runs. It used to be drawn
+        ;; independently and guarded with a `when`, so a short draw asserted
+        ;; nothing at all and the property passed vacuously.
         (let [thr (or (:threshold calibration) 64)
               k (h/draw! (g/integer thr (+ thr 36)))
-              n (h/draw! (g/integer 14 20))
-              toks (vec (tok (probe-text n)))]
-          (when (> (count toks) (+ k 32))
+              toks (loop [n 14]
+                     (let [t (vec (tok (probe-text n)))]
+                       (if (or (> (count t) (+ k 32)) (> n 200)) t (recur (* 2 n)))))]
+          (when true
             (let [base (subvec toks 0 (- (count toks) k))
                   suffix (subvec toks (- (count toks) k))
                   s state-session]
@@ -651,7 +667,7 @@
               ;; saved at an earlier evaluation is caught as a revision
               ;; mismatch. What must never happen is acceptance.
               (when-not (#{:score/base-state-mismatch
-                           :score/base-revision-mismatch
+                           :score/base-checkpoint-mismatch
                            :score/base-session-mismatch} got)
                 (throw (ex-info "a non-base state was accepted for candidate rewind"
                                 {:hegel/origin "score/base-must-be-exact" :got got})))
@@ -981,7 +997,7 @@
                   got (try (llama/score-candidates s cands {:state st-split}) :ACCEPTED
                            (catch Throwable e (:jolt.llama/error (ex-data e))))]
               ;; tokens are identical, so ONLY the revision identity can refuse it
-              (when-not (= :score/base-revision-mismatch got)
+              (when-not (= :score/base-checkpoint-mismatch got)
                 (throw (ex-info "a numerically different base with identical tokens was accepted"
                                 {:hegel/origin "c5/revision-refuses" :got got})))))))))))
 
@@ -1105,6 +1121,62 @@
             (throw (ex-info "a scoring failure produced an undefined outcome"
                             {:hegel/origin "c7/defined-outcome" :got outcome})))))))))
 
+
+(defn check-rewind-refused-after-divergence! [runner]
+  (report/run!
+   runner
+   "C5b: a checkpoint is refused once the session has diverged from it"
+   (fn []
+     (h/run-test!
+      {:test-cases 10 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; From an adversarial review of the revision check. An earlier version
+        ;; RESET the counter when restoring this session's own checkpoint, so
+        ;; two divergent evaluations could carry the same number:
+        ;;
+        ;;   eval -> 6, restore -> back to 5, evaluate something DIFFERENT -> 6
+        ;;
+        ;; and a checkpoint captured at the first 6 matched the second, which is
+        ;; the collision the revision existed to prevent. The counter now only
+        ;; advances and the identity is a unique per-save checkpoint id.
+        (let [s state-session
+              toks (vec (tok (probe-text 3)))]
+          (llama/clear! s)
+          (llama/eval! s toks)
+          (let [st (llama/save-state s)
+                r0 @(:revision s)
+                top (llama/top-k s 2 {:pieces? false})]
+            ;; move away, come back, then take a DIFFERENT branch
+            (llama/eval! s [(:token (first top))])
+            (llama/load-state! s st toks)
+            (llama/eval! s [(:token (second top))])
+            (when-not (< r0 @(:revision s))
+              (throw (ex-info "the revision counter did not advance monotonically"
+                              {:hegel/origin "c5b/monotonic" :from r0 :to @(:revision s)})))
+            (let [got (try (llama/score-candidates
+                            s [{:id :x :tokens [(:token (first top)) (:token (second top))]}]
+                            {:state st})
+                           :ACCEPTED
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+              (when-not (= :score/base-checkpoint-mismatch got)
+                (throw (ex-info "a diverged session accepted its old checkpoint"
+                                {:hegel/origin "c5b/refused-after-divergence" :got got})))))
+          ;; and the legitimate case still works: restore, then rewind
+          (llama/clear! s)
+          (llama/eval! s toks)
+          (let [st2 (llama/save-state s)
+                top (llama/top-k s 2 {:pieces? false})
+                ;; the call's own result, not a trailing keyword: (try A :OK ...)
+                ;; evaluates A and then returns :OK, so the assertion below
+                ;; could never see the map it was checking for
+                got (try (llama/score-candidates
+                          s [{:id :y :tokens [(:token (first top)) (:token (second top))]}]
+                          {:state st2})
+                         (catch Throwable e (:jolt.llama/error (ex-data e))))]
+            (when-not (map? got)
+              (throw (ex-info "a checkpoint the session is sitting on was refused"
+                              {:hegel/origin "c5b/on-checkpoint-accepted" :got got}))))))))))
+
 ;; ----------------------------------------------------------------- main
 
 (defn -main [& _]
@@ -1130,6 +1202,7 @@
     (println "--- candidate base state ---")
     (check-scoring-base-must-be-exact! runner)
     (check-same-tokens-different-numerical-base-refused! runner)
+    (check-rewind-refused-after-divergence! runner)
     (check-stale-base-logprobs-refused! runner)
     (check-base-logprobs-round-trip! runner)
     (check-scoring-failure-is-atomic! runner)

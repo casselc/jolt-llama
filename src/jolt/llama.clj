@@ -363,13 +363,19 @@
            ;; The token vector currently resident in seq 0. This is the Jolt-side
            ;; half of the token-identity contract; the C layer has no opinion.
            :tokens (atom [])
-           ;; MONOTONIC EVALUATION REVISION. Bumped by every operation that
-           ;; moves native state. Token equality is not NUMERICAL equality --
-           ;; the same token vector reached by a different call structure
-           ;; produces different logits below the calibrated append threshold --
-           ;; so a candidate-rewind checkpoint has to name the exact evaluation
-           ;; it was taken from, not merely the tokens it contains.
+           ;; STRICTLY MONOTONIC counter of state-moving operations. Never
+           ;; rewound. An earlier version reset it when restoring this session's
+           ;; own checkpoint, which let two DIVERGENT evaluations carry the same
+           ;; number: eval to 6, restore to 5, evaluate something different, and
+           ;; the session is at "6" again describing different logits. A
+           ;; checkpoint saved at the first 6 would then match the second.
            :revision (atom 0)
+           ;; The checkpoint this session is currently sitting ON, by unique
+           ;; state id, or nil once anything has moved it. This -- not the
+           ;; counter -- is what candidate rewind checks, because it answers the
+           ;; question that actually matters: is the session right now at the
+           ;; exact evaluation this state was captured from?
+           :at-checkpoint (atom nil)
            :state (atom :open)})))))
 
 (defn- session-ptr [s]
@@ -391,6 +397,7 @@
     (check! (c-session-clear p 0) :session-clear {})
     (reset! (:tokens session) [])
     (swap! (:revision session) inc)
+    (reset! (:at-checkpoint session) nil)
     :ok))
 
 ;; ----------------------------------------------------------------- tokenize
@@ -473,6 +480,7 @@
                {:jolt.llama/n-tokens n :jolt.llama/pos pos0}))
      (swap! (:tokens session) into toks)
      (swap! (:revision session) inc)
+     (reset! (:at-checkpoint session) nil)
      {:n-tokens n :pos pos0 :n-resident (count @(:tokens session))})))
 
 ;; ------------------------------------------------------------------- logits
@@ -584,8 +592,13 @@
              blob (byte-array n)]
          (ffi/with-alloc [buf n]
            (check! (c-state-save p (int seq-id) buf n np) :state-save {})
-           (let [written (ffi/read np :size_t)]
+           (let [written (ffi/read np :size_t)
+                 state-id (str (random-uuid))]
              (ffi/read-into! buf blob 0 written)
+             ;; Saving does not move native state, so the session IS at this
+             ;; checkpoint the moment it is taken. Recording that is what lets
+             ;; the very next score-candidates rewind to it.
+             (reset! (:at-checkpoint session) state-id)
              {::kind :state
               ;; THE compatibility coordinate. :model-content-id is the one that
               ;; decides; path and desc are kept for humans reading a descriptor
@@ -599,6 +612,10 @@
               ;; identical tokens can represent different numerical bases, so a
               ;; checkpoint used for candidate rewind must match the session
               ;; and revision it claims to be a checkpoint OF.
+              ;; unique per save: two saves of the same tokens at the same
+              ;; revision are still different checkpoints, and a counter alone
+              ;; could not say so
+              :state-id state-id
               :session-id (:session-id session)
               :revision @(:revision session)
               :runtime-id (runtime-build-id)
@@ -710,16 +727,16 @@
                               (int (:n-tokens state)) np)
                 :state-load {})
         (reset! (:tokens session) (:tokens state))
-        ;; Restoring THIS session's own checkpoint returns it to that
-        ;; checkpoint's numerical identity, so the revision goes back rather
-        ;; than forward -- otherwise a legitimate rewind would look like a new
-        ;; evaluation and the candidate-rewind round trip could never close.
-        ;; A checkpoint from ANOTHER session leaves this one at a new, unnamed
-        ;; revision: the bytes may load, but this session is not that session
-        ;; and must not start claiming to be.
-        (if (= (:session-id state) (:session-id session))
-          (reset! (:revision session) (:revision state))
-          (swap! (:revision session) inc))
+        ;; The counter always ADVANCES -- restoring is a state-moving operation
+        ;; like any other, and rewinding it would let two divergent evaluations
+        ;; share a number. What identifies the position is the checkpoint the
+        ;; session is now sitting on, which is unique per save and cannot
+        ;; collide. A checkpoint from ANOTHER session loads its bytes but does
+        ;; not put this session "on" it: this session is not that session.
+        (swap! (:revision session) inc)
+        (reset! (:at-checkpoint session)
+                (when (= (:session-id state) (:session-id session))
+                  (:state-id state)))
         {:n-read (ffi/read np :size_t)
          :n-tokens (:n-tokens state)}))))
 
@@ -783,6 +800,25 @@
    (load-state-unchecked! session state seq-id)))
 
 ;; -------------------------------------------------------- candidate scoring
+
+(defn- base-identity
+  "What identifies the evaluation a session is sitting on right now.
+
+  Two cases, and neither alone is sufficient:
+
+    a checkpoint has been taken -> its unique id. Stable across a restore TO
+      it, which is exactly the legitimate rewind score-candidates performs, so
+      a counter would reject the descriptor it had just returned.
+
+    no checkpoint               -> the monotonic revision. Two different
+      evaluations always carry different numbers, so a caller that never saved
+      still cannot replay one base's scores into another.
+
+  The session id is carried alongside so a descriptor from a different session
+  can never match by coincidence."
+  [session]
+  [(:session-id session)
+   (or @(:at-checkpoint session) [:rev @(:revision session)])])
 
 (defn- topk-map [session k]
   (into {} (map (juxt :token :logprob) (top-k session k {:pieces? false}))))
@@ -1045,8 +1081,15 @@
              (let [why (cond
                          (not= (:session-id state) (:session-id session))
                          :score/base-session-mismatch
-                         (not= (:revision state) @(:revision session))
-                         :score/base-revision-mismatch
+                         ;; The session must be sitting ON this exact
+                         ;; checkpoint. A counter cannot express it: restoring
+                         ;; is itself a state-moving operation so the number
+                         ;; always advances, and an earlier version that rewound
+                         ;; the counter let two DIVERGENT evaluations share one.
+                         ;; Only a unique per-save id says "this is the
+                         ;; evaluation you captured".
+                         (not= (:state-id state) @(:at-checkpoint session))
+                         :score/base-checkpoint-mismatch
                          (not= (vec (:tokens state)) (vec base-tokens))
                          :score/base-state-mismatch
                          :else nil)]
@@ -1078,9 +1121,7 @@
          _ (when base-logprobs
              (let [why (cond
                          (not (map? (:scores base-logprobs))) :score/base-logprobs-malformed
-                         (not= (:session-id base-logprobs) (:session-id session))
-                         :score/base-logprobs-mismatch
-                         (not= (:revision base-logprobs) @(:revision session))
+                         (not= (:base-identity base-logprobs) (base-identity session))
                          :score/base-logprobs-mismatch
                          (not (every? (:scores base-logprobs) first-tokens))
                          :score/base-logprobs-incomplete
@@ -1170,9 +1211,13 @@
       ;; feed this back as :base-logprobs to score the same base again after a
       ;; restore has cleared the session's logits. Bound to the session and
       ;; revision it came from, so it cannot be replayed into a different base.
-      :base-logprobs {:session-id (:session-id session)
-                      :revision @(:revision session)
+      :base-logprobs {:base-identity (base-identity session)
+                      :session-id (:session-id session)
                       :scores base-lp}
+      ;; The promoted/experimental split was documentation only, so a caller
+      ;; could not tell which guarantee it was relying on without reading a
+      ;; docstring. Reported per call, from what the candidates actually are.
+      :promoted? (not multi?)
       :convention :teacher-forced/first-from-base-rest-single-token
       :homogeneous? (= 1 (count (distinct (map :n-tokens ranked))))})))
 

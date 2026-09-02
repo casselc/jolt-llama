@@ -239,6 +239,8 @@ int main(int argc, char **argv) {
         if (jl_session_new(model, &sp, &ps) != JL_OK) {
             fprintf(stderr, "FAIL: could not build the fault-injection session\n"); return 1; }
 
+        /* arming the hook is deliberate; the shipped library refuses otherwise */
+        setenv("JL_ENABLE_TEST_HOOKS", "1", 1);
         /* fail the SECOND chunk, so the first has already touched the context */
         if (jl_test_fail_after_chunk(ps, 2) != JL_OK) {
             fprintf(stderr, "FAIL: could not arm fault injection\n"); return 1; }
@@ -251,6 +253,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: a poisoned session accepted an eval\n"); return 1; }
         if (jl_state_save(ps, 0, NULL, 0, &psz) != JL_ERR_POISONED) {
             fprintf(stderr, "FAIL: a poisoned session accepted a state save\n"); return 1; }
+        /* the header says EVERYTHING but clear and close, so check the rest */
+        if (jl_state_size(ps, 0, &psz) != JL_ERR_POISONED) {
+            fprintf(stderr, "FAIL: a poisoned session accepted a state size\n"); return 1; }
+        {
+            size_t pnr = 0;
+            if (jl_state_load(ps, 0, blob, written, (int32_t) n_tok, &pnr) != JL_ERR_POISONED) {
+                fprintf(stderr, "FAIL: a poisoned session accepted a state load\n"); return 1; }
+        }
 
         /* clear is the documented recovery, and it must work */
         if (jl_session_clear(ps, 0) != JL_OK) {

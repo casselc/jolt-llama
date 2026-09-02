@@ -241,8 +241,13 @@ jl_status jl_sha256_hex(const uint8_t *data, size_t len, char *out, size_t cap);
 /*
  * TEST-ONLY. Make the decode of chunk `n` (1-based) report failure on the next
  * jl_eval, so the partial-failure and poisoning path can be exercised. 0
- * disables. Exported rather than hidden behind a build flag, so the library
- * under test is the library that ships.
+ * disables.
+ *
+ * Exported rather than hidden behind a build flag, so the library under test is
+ * the library that ships -- but arming it requires JL_ENABLE_TEST_HOOKS=1 in
+ * the environment. Without that any consumer holding a session pointer could
+ * inject a decode failure, which is an availability hazard even though it is
+ * not a memory-safety one.
  */
 jl_status jl_test_fail_after_chunk(jl_session *session, int32_t n);
 

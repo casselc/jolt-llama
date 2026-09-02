@@ -27,6 +27,7 @@ fi
 
 only="${1:-all}"
 fail=0
+oracle_skipped=0
 
 # THE hard requirement: the core library must run on stock Jolt. This runs the
 # example with no alias at all, so jolt-hegel is not on the classpath and the
@@ -57,7 +58,12 @@ run_oracle() {
   echo "=== M0 oracle: native C vs Jolt, raw float bits ==="
   if [ ! -x native/smoke ]; then
     if [ "${JOLT_LLAMA_ALLOW_NO_SMOKE:-0}" = "1" ]; then
-      echo "  SKIPPED (JOLT_LLAMA_ALLOW_NO_SMOKE=1)"; return 0
+      # The escape hatch is for a local inner loop. It used to print one line
+      # and let the run finish as "SUITE OK", so a promotion log could not be
+      # told apart from a real one. It now marks the whole run.
+      echo "  SKIPPED (JOLT_LLAMA_ALLOW_NO_SMOKE=1)"
+      oracle_skipped=1
+      return 0
     fi
     echo "  FAIL: native/smoke is not built; the oracle cannot run" >&2
     fail=1; return 0
@@ -116,5 +122,12 @@ case "$only" in
 esac
 
 echo
-[ "$fail" -eq 0 ] && echo "SUITE OK" || echo "SUITE FAILURES"
+if [ "$fail" -ne 0 ]; then
+  echo "SUITE FAILURES"
+elif [ "$oracle_skipped" -eq 1 ]; then
+  # Not a promotion result: the C-vs-Jolt oracle did not run.
+  echo "SUITE OK (NOT A PROMOTION RUN -- the M0 oracle was skipped)"
+else
+  echo "SUITE OK"
+fi
 exit "$fail"
