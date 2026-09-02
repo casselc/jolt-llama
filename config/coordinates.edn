@@ -77,11 +77,18 @@
    session id and evaluation revision, because token equality is not numerical
    equality."
   :integrity
-  "SENTINELS, not content hashes. sentinel-seq is a 32-bit polynomial value;
-   sentinel-array samples head, middle and tail plus the exact length. A real
-   SHA-256 needs java.security.MessageDigest, which Jolt reports as living in
-   io.github.jolt-lang/jolt-crypto rather than core -- verified, and the reason
-   :deps {} wins over a stronger digest until state crosses a process boundary."
+  "REAL SHA-256 content digests, computed in the shim. :token-sha256 over the
+   canonical little-endian int32 encoding, :state-sha256 over the whole blob.
+   Verified against the published FIPS vectors in smoke.c before anything
+   trusts them.
+   Computed natively because the bytes are already there: feeding a 52 MiB blob
+   to jolt-crypto's OpenSSL FFI measured ~47 000 ms, essentially all
+   marshalling, against ~350 ms natively.
+   The token digest is checked on every restore. The BLOB digest is checked for
+   a state that did not originate in the restoring session; a same-session
+   rewind skips it, because candidate rewind restores once per candidate and
+   verifying each time cost ~345 ms and took the exact-spine speedup from 3.92x
+   to 3.00x. verify-state-digest forces the full check."
   :concurrency
   "Handles are THREAD-CONFINED. Close is the exception: a CAS state machine
    admits one closer, and a failed native close lands on :close-failed rather

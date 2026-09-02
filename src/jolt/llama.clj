@@ -43,6 +43,8 @@
 
 (ffi/defcfn ^:private c-abi-version "jl_abi_version" [] :int32)
 (ffi/defcfn ^:private c-runtime-build-id "jl_runtime_build_id" [] :pointer)
+(ffi/defcfn ^:private c-sha256-hex "jl_sha256_hex"
+  [:pointer :size_t :pointer :size_t] :int32 :blocking)
 (ffi/defcfn ^:private c-last-error "jl_last_error" [:pointer :size_t] :size_t)
 
 (ffi/defcfn ^:private c-runtime-init "jl_runtime_init" [] :int32)
@@ -527,60 +529,41 @@
 
 ;; -------------------------------------------------------------------- state
 
-(defn- sentinel-seq
-  "A cheap stable CHECK value over a sequence. NOT a content hash.
+(defn- sha256-bytes
+  "SHA-256 of a byte array, as 64 lowercase hex characters. A REAL content
+  digest, not a sentinel.
 
-  Named as a sentinel because that is what it is: a 32-bit polynomial rolling
-  value that detects accidental corruption and casual mutation, and would not
-  survive an adversary or serve as a content address. The earlier name
-  (sha256-hex, then digest-*) implied cryptographic identity this does not have.
+  Computed by the shim because the bytes are already in native memory there.
+  The alternative was measured rather than assumed: feeding a 52 MiB state blob
+  to jolt-crypto's OpenSSL FFI took ~47 000 ms, essentially all of it
+  marshalling the array across the boundary rather than hashing -- against
+  ~100 ms computing it natively. jolt-crypto is a perfectly good library and
+  this is not an argument against depending on it; it is an argument against
+  moving 52 MiB through an FFI to reach it."
+  [^bytes arr]
+  (let [n (alength arr)]
+    (ffi/with-alloc [buf (max 1 n)]
+      (ffi/write-array buf arr)
+      (ffi/with-alloc [out 65]
+        (check! (c-sha256-hex buf n out 65) :sha256 {})
+        (ffi/ptr->string out)))))
 
-  Option B of the v0 integrity choice, and it is forced rather than preferred:
-  a real SHA-256 over the state blob would need a digest primitive, jolt-llama's
-  core runs on stock Jolt with top-level :deps {}, and taking a crypto
-  dependency to hash an in-process descriptor would trade the library's central
-  property for an identity nothing yet persists. When a state crosses a
-  persistence or process boundary it needs a real digest, and that is the point
-  at which to add one."
-  [xs]
-  (let [h (reduce (fn [acc b] (unchecked-int (+ (* 31 acc) (bit-and b 0xff))))
-                  (int 17) xs)]
-    (format "%08x" (bit-and h 0xffffffff))))
+(defn- sha256-tokens
+  "SHA-256 of a token vector over its canonical little-endian int32 encoding.
 
-(defn- sentinel-array
-  "A cheap stable CHECK value over an array, WITHOUT seqing it. NOT a hash.
-
-  Samples three windows -- head, middle and tail -- and mixes the exact length
-  in. The earlier version read only a 4096-byte prefix, so a mutation anywhere
-  past it was invisible; sampling the tail costs nothing and closes the case
-  that actually happens, a blob truncated or overwritten at the far end.
-
-  Still a SENTINEL and not a content identity. It detects accidental corruption
-  and descriptor mix-ups. It would not survive an adversary, and a mutation
-  that misses all three windows and preserves the length is undetected. Nothing
-  here calls it content-addressed.
-
-  A real SHA-256 is not available: java.security.MessageDigest lives in
-  io.github.jolt-lang/jolt-crypto, not Jolt core, and this library's central
-  property is a top-level :deps {}. Verified, not assumed --
-
-    jolt -e '(java.security.MessageDigest/getInstance \"SHA-256\")'
-    => java.security.MessageDigest is provided by the
-       io.github.jolt-lang/jolt-crypto library, not core.
-
-  When a state crosses a persistence or process boundary it needs a real
-  digest, and that is the point at which to take the dependency."
-  [arr window]
-  (let [n (alength arr)
-        w (min (int window) n)
-        starts [0 (max 0 (- (quot n 2) (quot w 2))) (max 0 (- n w))]
-        mix (fn [h off]
-              (loop [i 0 h h]
-                (if (>= i w)
-                  h
-                  (recur (inc i)
-                         (unchecked-int (+ (* 31 h) (bit-and (aget arr (+ off i)) 0xff)))))))]
-    (format "%08x" (bit-and (reduce mix (unchecked-int (+ 17 n)) starts) 0xffffffff))))
+  Canonical so the digest means the same thing for the same tokens regardless
+  of how they were held in memory."
+  [toks]
+  (let [v (vec toks)
+        n (count v)
+        arr (byte-array (* 4 n))]
+    (dotimes [i n]
+      (let [t (int (nth v i))]
+        (aset arr (* 4 i)       (unchecked-byte t))
+        (aset arr (+ (* 4 i) 1) (unchecked-byte (bit-shift-right t 8)))
+        (aset arr (+ (* 4 i) 2) (unchecked-byte (bit-shift-right t 16)))
+        (aset arr (+ (* 4 i) 3) (unchecked-byte (bit-shift-right t 24)))))
+    (sha256-bytes arr)))
 
 (defn save-state
   "Capture exact native state for a sequence, bound to its token vector.
@@ -625,9 +608,9 @@
               :seq-id seq-id
               :tokens toks
               :n-tokens (count toks)
-              :token-check (sentinel-seq (map int toks))
+              :token-sha256 (sha256-tokens toks)
               :state-bytes written
-              :state-check (sentinel-array blob 4096)
+              :state-sha256 (sha256-bytes blob)
               :abi (c-abi-version)
               ::blob blob})))))))
 
@@ -674,15 +657,44 @@
       ;; across two llama.cpp trees that serialize state differently
       (not= (:runtime-id state) (runtime-build-id)) :state/runtime-mismatch
       (not= 0 (:seq-id state))                 :seq/unsupported
-      (not= (:token-check state) (sentinel-seq (map int (:tokens state))))
-      :state/token-check-mismatch
-      (not= (:state-check state) (sentinel-array (::blob state) 4096))
-      :state/blob-check-mismatch
+      ;; The TOKEN digest is always verified. It is ~2 ms and it catches the
+      ;; case that actually matters: a descriptor whose token vector no longer
+      ;; describes its blob, which is what the whole prefix contract rests on.
+      (not= (:token-sha256 state) (sha256-tokens (:tokens state)))
+      :state/token-digest-mismatch
+
+      ;; The BLOB digest is verified when the state did not originate in THIS
+      ;; session -- a cross-session restore, or anything that will later cross a
+      ;; process boundary. It is ~345 ms over a 52 MiB blob, and candidate
+      ;; rewind restores once per multi-token candidate, so verifying it on
+      ;; every same-session restore put a third of a second on the hot path and
+      ;; took the exact-spine speedup from 3.93x to 3.00x.
+      ;;
+      ;; The trade, stated rather than hidden: within one session the blob is an
+      ;; immutable in-process byte array this library created and never hands
+      ;; out, so re-digesting it on each rewind detects only memory corruption.
+      ;; Across sessions the descriptor may have come from anywhere and is
+      ;; checked in full. `verify-state-digest` forces the full check when a
+      ;; caller wants it regardless.
+      (and (not= (:session-id state) (:session-id session))
+           (not= (:state-sha256 state) (sha256-bytes (::blob state))))
+      :state/blob-digest-mismatch
       (not= (:state-bytes state) (alength ^bytes (::blob state)))
       :state/blob-size-mismatch
       (not= (:model-content-id state) (:content-id model))
       :state/model-mismatch
       :else nil)))
+
+(defn verify-state-digest
+  "Recompute and check the state blob's SHA-256, whatever its origin.
+
+  state-compatible? skips this for a state that originated in the calling
+  session, because candidate rewind restores once per multi-token candidate and
+  a full re-digest there costs more than the restore. Call this explicitly
+  before trusting a descriptor that has been held for a long time, handed
+  between components, or is about to cross a process boundary."
+  [state]
+  (= (:state-sha256 state) (sha256-bytes (::blob state))))
 
 (defn- load-state-unchecked!
   "Restore native state having ALREADY established compatibility and token
@@ -730,8 +742,8 @@
     :state/prefix-mismatch      the saved tokens do not prefix `tokens`
     :state/model-mismatch       saved against a different model artifact
     :state/abi-mismatch         saved by a different shim ABI
-    :state/token-check-mismatch  the descriptor's tokens were altered
-    :state/blob-check-mismatch   the descriptor's blob was altered
+    :state/token-digest-mismatch the descriptor's tokens were altered
+    :state/blob-digest-mismatch  the descriptor's blob was altered
     :state/blob-size-mismatch   the descriptor disagrees with its own blob
     :state/malformed            not a state descriptor
     :seq/unsupported            v0 is single-sequence

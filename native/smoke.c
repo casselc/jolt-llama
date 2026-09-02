@@ -83,6 +83,22 @@ int main(int argc, char **argv) {
      * as raw IEEE-754 bits on ORACLE: lines that scripts/run-tests.sh diffs
      * against Jolt's. Anything a human reads stays below.
      */
+    /* SHA-256 against the published FIPS test vectors, before anything trusts it */
+    {
+        char hx[65];
+        if (jl_sha256_hex((const uint8_t *) "", 0, hx, sizeof(hx)) != JL_OK ||
+            strcmp(hx, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")) {
+            fprintf(stderr, "FAIL: sha256(\"\") = %s\n", hx); return 1; }
+        if (jl_sha256_hex((const uint8_t *) "abc", 3, hx, sizeof(hx)) != JL_OK ||
+            strcmp(hx, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) {
+            fprintf(stderr, "FAIL: sha256(\"abc\") = %s\n", hx); return 1; }
+        if (jl_sha256_hex((const uint8_t *)
+              "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, hx, sizeof(hx)) != JL_OK ||
+            strcmp(hx, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")) {
+            fprintf(stderr, "FAIL: sha256(56-byte vector) = %s\n", hx); return 1; }
+        printf("sha256_vectors=ok\n");
+    }
+
     printf("ORACLE abi=%d\n", (int) jl_abi_version());
     printf("ORACLE runtime=%s\n", jl_runtime_build_id());
     printf("ORACLE n_tokens=%zu\n", n_tok);

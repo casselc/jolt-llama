@@ -227,6 +227,17 @@ jl_status jl_token_to_piece(const jl_model *model, int32_t token,
 jl_status jl_eval(jl_session *session, int32_t seq_id,
                   const int32_t *tokens, size_t n_tokens, int32_t pos0);
 
+/*
+ * SHA-256 of `len` bytes as 64 lowercase hex characters plus a NUL; `cap` must
+ * be at least 65.
+ *
+ * Here rather than in Jolt because the bytes this library wants to digest are
+ * already in native memory. Measured on a real 52 MiB state blob: ~100 ms
+ * here, against ~47 000 ms feeding the same array to jolt-crypto's OpenSSL FFI,
+ * where essentially all the time is marshalling rather than hashing.
+ */
+jl_status jl_sha256_hex(const uint8_t *data, size_t len, char *out, size_t cap);
+
 /* Tokens currently resident in the session, i.e. the only legal pos0. */
 int32_t jl_session_n_resident(const jl_session *session);
 

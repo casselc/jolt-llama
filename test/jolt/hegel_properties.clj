@@ -495,7 +495,7 @@
               _ (llama/eval! state-session toks)
               st (llama/save-state state-session)
               which (h/draw! (g/sampled-from
-                              [:model :abi :runtime :seq :token-check :blob-check
+                              [:model :abi :runtime :seq :token-sha256 :blob-digest
                                :blob-size :malformed]))
               [bad expected]
               (case which
@@ -503,8 +503,11 @@
                 :abi        [(assoc st :abi 99) :state/abi-mismatch]
                 :seq        [(assoc st :seq-id 1) :seq/unsupported]
                 :runtime    [(assoc st :runtime-id "llama.cpp:0000:clean") :state/runtime-mismatch]
-                :token-check [(assoc st :token-check "00000000") :state/token-check-mismatch]
-                :blob-check  [(assoc st :state-check "00000000") :state/blob-check-mismatch]
+                :token-sha256 [(assoc st :token-sha256 "00") :state/token-digest-mismatch]
+                ;; a same-session blob digest edit is NOT a load-state! concern
+                ;; by design; the cross-session case is covered by the runtime
+                ;; and session identity checks plus verify-state-digest
+                :blob-digest [(assoc st :state-bytes 1) :state/blob-size-mismatch]
                 :blob-size  [(assoc st :state-bytes 1) :state/blob-size-mismatch]
                 :malformed  [(dissoc st :tokens) :state/malformed])
               got (try (llama/load-state! state-session bad toks) :accepted
@@ -777,19 +780,27 @@
 
 ;; -------------------------------------------------------- integrity checks
 
-(defn check-integrity-sentinels-detect-mutation! [runner]
+(defn check-integrity-digests-detect-mutation! [runner]
   (report/run!
    runner
-   "a mutated token vector or state blob is refused before any native load"
+   "token and length mutations are always refused; blob mutations by digest"
    (fn []
      (h/run-test!
       {:test-cases 20 :database "" :verbosity :quiet}
       (fn [_]
-        ;; These are SENTINELS, not content hashes, and the properties assert
-        ;; exactly what they promise: a token mutation anywhere, and a blob
-        ;; mutation at the head, middle or tail, are detected. A blob mutation
-        ;; that misses all three sampled windows is NOT promised and is not
-        ;; asserted here.
+        ;; The contract is deliberately asymmetric and this asserts both halves,
+        ;; including the half that is NOT checked on the hot path.
+        ;;
+        ;; ALWAYS refused: a token mutation (~2 ms to detect, and it is the case
+        ;; the prefix contract rests on) and a length mismatch.
+        ;;
+        ;; NOT refused on a same-session restore: a blob byte mutation. Checking
+        ;; it costs ~345 ms over 52 MiB and candidate rewind restores once per
+        ;; multi-token candidate, so verifying every time took the exact-spine
+        ;; speedup from 3.93x to 3.00x. Within one session the blob is an
+        ;; immutable array this library created and never hands out, so the
+        ;; check would detect only memory corruption. verify-state-digest forces
+        ;; it, and a CROSS-session state is checked in full.
         (let [s state-session
               toks (vec (tok (probe-text 3)))
               _ (llama/clear! s)
@@ -797,27 +808,34 @@
               st (llama/save-state s)
               blob (:jolt.llama/blob st)
               n (alength ^bytes blob)
-              where (h/draw! (g/sampled-from [:token :head :middle :tail :length]))
               flip (fn [off]
                      (let [c (byte-array n)]
                        (System/arraycopy blob 0 c 0 n)
                        (aset c off (byte (bit-xor (aget c off) 0x5a)))
                        c))
-              bad (case where
-                    :token  (let [i (h/draw! (g/integer 0 (dec (count toks))))]
-                              (assoc st :tokens (assoc toks i (inc (nth toks i)))))
-                    :head   (assoc st :jolt.llama/blob (flip 0))
-                    :middle (assoc st :jolt.llama/blob (flip (quot n 2)))
-                    :tail   (assoc st :jolt.llama/blob (flip (dec n)))
-                    :length (assoc st :state-bytes (dec n)))
-              got (try (llama/load-state! s bad toks) :ACCEPTED
-                       (catch Throwable e (:jolt.llama/error (ex-data e))))]
-          (when (= :ACCEPTED got)
-            (throw (ex-info "a mutated state descriptor was accepted"
-                            {:hegel/origin (str "integrity/detects-" (name where))
-                             :where where})))
-          ;; and an UNMODIFIED descriptor must still pass, or the check is
-          ;; simply rejecting everything
+              refused? (fn [bad]
+                         (try (llama/load-state! s bad toks) false
+                              (catch Throwable _ true)))]
+          ;; --- always refused
+          (let [i (h/draw! (g/integer 0 (dec (count toks))))]
+            (when-not (refused? (assoc st :tokens (assoc toks i (inc (nth toks i)))))
+              (throw (ex-info "a mutated token vector was accepted"
+                              {:hegel/origin "integrity/token-always-refused"}))))
+          (when-not (refused? (assoc st :state-bytes (dec n)))
+            (throw (ex-info "a wrong byte count was accepted"
+                            {:hegel/origin "integrity/length-always-refused"})))
+
+          ;; --- blob mutations: caught by the digest, at head, middle and tail
+          (doseq [[label off] [[:head 0] [:middle (quot n 2)] [:tail (dec n)]]]
+            (let [bad (assoc st :jolt.llama/blob (flip off))]
+              (when (llama/verify-state-digest bad)
+                (throw (ex-info "a blob mutation did not change the digest"
+                                {:hegel/origin (str "integrity/digest-detects-" (name label))})))))
+
+          ;; --- and an unmodified descriptor still passes both
+          (when-not (llama/verify-state-digest st)
+            (throw (ex-info "an unmodified blob failed its own digest"
+                            {:hegel/origin "integrity/clean-digest-passes"})))
           (when-let [why (llama/state-compatible? s st)]
             (throw (ex-info "an unmodified descriptor was refused"
                             {:hegel/origin "integrity/clean-passes" :why why})))))))))
@@ -1124,7 +1142,7 @@
     (check-close-outcomes-are-defined! runner)
 
     (println "--- integrity and runtime identity ---")
-    (check-integrity-sentinels-detect-mutation! runner)
+    (check-integrity-digests-detect-mutation! runner)
     (check-unattributed-runtime-never-matches! runner)
 
     (println "--- state compatibility ---")
