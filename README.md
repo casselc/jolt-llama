@@ -47,9 +47,14 @@ only **2792** of them are a true prefix of `spine ++ delta`. Naive
 concatenation of separately-tokenized parts gives 3484 tokens where the
 canonical projection gives 3483.
 
-    (llama/load-state! s st {:for-tokens full-token-vector})
-    ;; => throws :state/prefix-mismatch with :jolt.llama/diverges-at
-    ;;    unless the saved tokens are a genuine prefix of full-token-vector
+    (llama/load-state! s st full-token-vector)
+    ;; tokens are REQUIRED, not an option. Throws :state/prefix-mismatch with
+    ;; :jolt.llama/diverges-at unless the saved tokens are a genuine prefix.
+    ;; When the check was optional, the shortest call was also the unsafe one.
+
+State is additionally bound to the model's content sha256, the shim ABI, the
+sequence id, and hashes of both the token vector and the blob, so a state saved
+against a different model or a different ABI is refused before any native call.
 
 There is no text-prefix heuristic anywhere in this library, and no silent
 rollback. A mismatch is refused with the divergence index attached; recovering

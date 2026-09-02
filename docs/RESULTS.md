@@ -204,3 +204,145 @@ ranking barely moves between a healthy topology and a badly degraded one
 (`hold` at `-0.827` vs `-0.833`), and `hold` wins both. The example demonstrates
 the *shape* -- closed domain, exact comparability, selection by trusted code --
 and is not evidence that this model makes good operational decisions.
+
+---
+
+# v0 promotion hardening
+
+A short pass after review, to close native-lifetime and state-identity gaps and
+freeze a coordinate Samizdat can depend on. The earlier sections are the
+original evidence and are not rewritten.
+
+## Safety issues found
+
+**A real use-after-free.** `jl_model_close` freed the `llama_model` and its
+wrapper unconditionally, while a live `jl_session` still held both that
+`jl_model*` and a `llama_context` built from it:
+
+    model = jl_model_open(...)
+    sess  = jl_session_new(model, ...)
+    jl_model_close(model)          <- freed
+    jl_eval(sess, ...)             <- used
+
+**A comment that was wrong in the dangerous direction.** `jl_model_close`
+claimed the cleared fields made a second raw close "a clean
+JL_ERR_INVALID_ARG ... rather than a use-after-free". After `free(model)` the
+struct is gone, so a second call reads freed memory *before* it can check
+anything. Idempotent close is a property of the Jolt wrapper and cannot be
+provided at the C layer without an out-of-band handle table. Deliberately not
+demonstrated by calling a freed pointer, which would prove it by committing the
+fault.
+
+**Sequence identity was misrepresented.** One token ledger per session, but
+`seq-id` and `n-seq-max` were exposed, so a second native sequence would have
+had no distinct token identity to check a restore against.
+
+**Evaluation could silently desynchronise.** `eval!` took an arbitrary `:pos`
+and truncated its token vector there; the native recurrent/KV state was not
+truncated to the same position.
+
+**State identity was not identity.** Saved state was bound to model *path* and
+*description*. A path can point at different bytes between runs, and
+descriptions collide across quantizations.
+
+**The core invariant was bypassable, and the bypass was the shortest call.**
+`(load-state! session state)` skipped the token-prefix check entirely.
+
+## Changes
+
+| Area | Change |
+| --- | --- |
+| Ownership | `jl_model` refcounts sessions; `jl_model_close` returns `JL_ERR_SESSIONS_ACTIVE` while any live, non-destructively. Jolt throws `:model/sessions-active`. Child sessions are never closed behind the caller's back. |
+| Sequence | `n_seq_max != 1` and `seq_id != 0` refused (`:seq/unsupported`), not clamped. v0 is deliberately single-sequence. |
+| Append | `:pos` removed; there is no public unsafe variant. The shim tracks its own resident count and answers `JL_ERR_NOT_APPEND`, so the rule holds even if the Jolt ledger were wrong. |
+| State identity | Bound to the GGUF's sha256 (computed once at open), ABI, seq id, token vector + hash, blob size + hash. `state-compatible?` names *which* rule failed, and runs before the native call — `llama_state_seq_set_data` given a foreign blob does not reliably fail, it can succeed into nonsense. |
+| Token prefix | `tokens` is now a required positional argument to `load-state!`. The unchecked path is private. |
+| ABI | 1 → 2, checked exactly rather than as a floor. |
+| FFI | `:blocking` on the calls that measured in the hundreds of ms (model open, session new, eval, state save/load); deliberately not on scalar queries. |
+
+Model identity is keyed on **content, not handle**. Two handles over the same
+GGUF are the same model, and refusing that restore would be the kind of false
+negative that teaches callers to reach for an unchecked path. There is a
+property asserting that restore is *accepted*.
+
+## Clean llama.cpp coordinate
+
+The prior coordinate was a fork SHA plus a captured dirty diff. Two findings:
+
+* The diff is XDNA2/NPU offload for BitNet I2_S GEMMs, gated at build *and*
+  runtime. Qwen3.5 Q4_0 never takes the I2_S path and the build never set
+  `BITNET_XDNA_RUNTIME_DIR` — `nm` shows zero `bitnet_xdna` symbols. It was
+  never needed.
+* `390c3077` is a **fork** commit, not an upstream ancestor. The GitHub API
+  resolves it because forks share a commit network; `compare` reports it as
+  diverged. Its `ggml-cpu/CMakeLists.txt` references
+  `../../../../src/ggml-bitnet-lut.cpp`, a file in BitNet's parent tree, so it
+  **cannot build standalone**. The first clone-and-build attempt failed exactly
+  there.
+
+Promoted instead:
+
+    ggml-org/llama.cpp  b81c99b479d4c24e5eeca10de99032ebd343ef8f   (clean tree)
+
+One API difference, absorbed by the shim: llama.cpp replaced
+`use_mmap`/`use_mlock` with a `load_mode` enum. `native/Makefile` probes
+`llama.h` and defines `JL_HAS_LOAD_MODE`, so one source builds against both and
+`jl_model_params` keeps its two booleans. Probed rather than version-gated
+because llama.cpp exposes no API version macro.
+
+## Regression gate on the clean build
+
+| Gate | Result |
+| --- | --- |
+| C oracle | `SMOKE OK` at ABI 2, including ownership and append assertions |
+| M0 | logits **bit-identical** to the experimental build — token 11751 at `-1.555883` |
+| M1 | `max_abs_dlogprob = 0.00000000` at **4.01x**, same 1-token BPE seam |
+| Alternating | 100 cycles, **0** mismatches, **0** contamination |
+| Hegel | **14** contract properties pass, 0 failures; both seam demonstrations still find and shrink counterexamples |
+| Stock Jolt | example runs with no alias; `:deps {}` still true |
+
+Two different llama.cpp builds producing the same logit to six decimals is the
+strongest single piece of evidence here.
+
+The state blob is 20263652 bytes on the clean build against 20263632 on the
+fork — a 20-byte serialization difference. Harmless, and exactly why state now
+carries an ABI and a model content id instead of being assumed portable.
+
+## Performance: one regression, expected and bounded
+
+| Operation | before | after |
+| --- | ---: | ---: |
+| **open-model** | 287 ms | **1437 ms** |
+| new-session | 25 ms | 26 ms |
+| cold prefill | 4357 ms | 4240 ms |
+| save-state | 374 ms | 375 ms |
+| load-state! | 203 ms | 201 ms |
+| restore + delta | 1119 ms (3.90x) | 1100 ms (3.90x) |
+| 5 single-token candidates | 4 ms | 4 ms |
+
+The single regression is sha256 over a 0.52 GiB GGUF, computed **once** when a
+model is opened. The file is never hashed again — not per state save, not per
+load, not per decision. Buying a real artifact identity for about a second at
+startup is the right trade, since a descriptor bound to a path and a
+description was not an identity at all.
+
+## Exact coordinates
+
+    jolt         v0.8.0  ccd6a73fd20b8e69cba654e008024958d5b4bd8a
+    llama.cpp    b81c99b479d4c24e5eeca10de99032ebd343ef8f  (clean)
+    jolt-hegel   2186afd9fef8b8ba766af5ea06b517e6af36cd4e  (libhegel v0.33.3)
+    model        qwen3.5-0.8b-q4_0.gguf
+                 sha256 57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf
+
+## Deferred
+
+* **Aspect join points (§12).** Not attempted in this pass. They are P1 behind
+  the safety items, and the safety items plus the clean-build migration used
+  the budget. Nothing in the library depends on them and no runtime dependency
+  on an aspect compiler was added.
+* **Multi-sequence support.** Explicitly out of scope: v0 is single-sequence by
+  construction, and candidate forking via `llama_memory_seq_cp` needs a
+  per-sequence identity design with its own validation.
+* **The 20-byte state format difference between builds** is recorded, not
+  investigated. State is not claimed to be portable across llama.cpp builds,
+  and the ABI/content checks now enforce that.
