@@ -1,0 +1,215 @@
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index fd5ba9989..6e0b30770 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -59,6 +59,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
+     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu ../../../../include)
+ 
++    # Experimental XDNA2 (Ryzen AI NPU) offload for I2_S prefill GEMMs.
++    # Opt-in at build time and again at runtime (BITNET_XDNA=1), so a build with
++    # this on still produces a CPU-only-capable binary.
++    if (BITNET_XDNA_RUNTIME_DIR)
++        message(STATUS "BitNet XDNA2 offload enabled: ${BITNET_XDNA_RUNTIME_DIR}")
++        target_sources(${GGML_CPU_NAME} PRIVATE
++            ${BITNET_XDNA_RUNTIME_DIR}/bitnet_xdna.cpp
++            ${BITNET_XDNA_RUNTIME_DIR}/xdna_gemm.cpp
++            ${BITNET_XDNA_RUNTIME_DIR}/bitnet_i2s.c
++            ${BITNET_XDNA_RUNTIME_DIR}/ggml_node_profile.c)
++        target_include_directories(${GGML_CPU_NAME} PRIVATE
++            ${BITNET_XDNA_RUNTIME_DIR} ${BITNET_XDNA_XRT_INCLUDE})
++        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_BITNET_XDNA GGML_BITNET_PROFILE)
++        target_link_libraries(${GGML_CPU_NAME} PRIVATE xrt_coreutil)
++    endif()
++
+     if (APPLE AND GGML_ACCELERATE)
+         find_library(ACCELERATE_FRAMEWORK Accelerate)
+         if (ACCELERATE_FRAMEWORK)
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ec88ef29a..a10327511 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -56,6 +56,17 @@
+ #include "ggml-bitnet.h"
+ #endif
+ 
++// Must sit outside the TL1/TL2 guard: the XDNA2 offload targets the I2_S path,
++// which is live in the default build where both TL options are OFF.
++#ifdef GGML_BITNET_XDNA
++#include "bitnet_xdna.h"
++#include <stdatomic.h>
++#endif
++
++#ifdef GGML_BITNET_PROFILE
++#include "ggml_node_profile.h"
++#endif
++
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+ #    include "spacemit/ime.h"
+ #endif
+@@ -1492,7 +1503,124 @@ UseGgmlGemm2:;
+     if (src0->type == GGML_TYPE_I2_S && ggml_n_dims(src0) == 2) {
+         const void * src1_wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t i2s_row_size = ggml_row_size(vec_dot_type, ne10);
+-        const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? i2s_row_size : nb11;
++        // src1_cont is only declared inside the GGML_USE_LLAMAFILE block above,
++        // so this path did not compile with -DGGML_LLAMAFILE=OFF. Recompute it
++        // locally; ggml_is_contiguous is cheap and the value is identical.
++        const bool i2s_src1_cont = ggml_is_contiguous(src1);
++        const size_t src1_col_stride = i2s_src1_cont || src1->type != vec_dot_type ? i2s_row_size : nb11;
++
++#ifdef GGML_BITNET_XDNA
++        // NPU-assisted prefill, run CONCURRENTLY with the CPU threads.
++        //
++        // Placed before the per-thread row split below: the CPU path shards ne01
++        // across threads and calls ggml_gemm_i2_i8_s with only 4 tokens at a
++        // time, so hooking there would mean one NPU dispatch per 4 tokens.
++        //
++        // The batch is split by token: thread 0 drives the NPU over tokens
++        // [0, t_npu) while threads 1..nth-1 compute [t_npu, ne11) on the CPU.
++        // Exclusive offload left those cores idle on a barrier for ~76% of a
++        // prefill, which is why it lost despite the NPU being the faster engine
++        // for this arithmetic.
++        //
++        // Decode (ne11 small) never qualifies, so CPU decode is untouched.
++        if (bitnet_xdna_available() &&
++            bitnet_xdna_worth_it(ne11) &&
++            bitnet_xdna_supports(ne00, ne01)) {
++
++            // Thread-aware: thread 0 is consumed driving the device, so the
++            // CPU's share is served by nth-1 workers, not nth. A fixed fraction
++            // is wrong at both ends -- at low thread counts the NPU should take
++            // everything, at high counts it should take less than half or step
++            // aside entirely. See bitnet_xdna_token_split_nt.
++            const int64_t t_npu = (nth > 1) ? bitnet_xdna_token_split_nt(ne11, nth) : ne11;
++            if (t_npu > 0) {
++                static _Atomic int xdna_result;
++
++                if (ith == 0) {
++                    // Single-flight lease over the WHOLE invocation. accumulate()
++                    // publishes process-global state (output-slot plan, shared
++                    // accumulator, shape identity) that the epilogue reads after
++                    // the barrier holding no lock. Within one graph the barrier
++                    // orders that; across two inference contexts in one process
++                    // it orders nothing, and the second context overwrites the
++                    // first's plan mid-read. Measured: SIGSEGV without this.
++                    // Released only after every reader below has finished.
++                    bitnet_xdna_invocation_begin();
++                    atomic_store(&xdna_result,
++                                 bitnet_xdna_accumulate(src0->data, ne00, ne01,
++                                                        (const int8_t *)src1_wdata,
++                                                        t_npu, src1_col_stride));
++                } else if (t_npu < ne11) {
++                    // The CPU's share: tokens [t_npu, ne11), ne01 sharded over
++                    // threads 1..nth-1. Same arithmetic as the block below,
++                    // restricted to a token range and one fewer thread.
++                    const int64_t cith = ith - 1, cnth = nth - 1;
++                    const int64_t mnc  = 4;
++                    int64_t s0 = (cith * ne01) / cnth;
++                    int64_t s1 = ((cith + 1) * ne01) / cnth;
++                    s0 = (s0 % mnc) ? s0 + mnc - (s0 % mnc) : s0;
++                    s1 = (s1 % mnc) ? s1 + mnc - (s1 % mnc) : s1;
++                    if (s0 < s1) {
++                        const float * xsc = (const float *)((const char *)src1_wdata + (ne11 * ne10));
++                        const int32_t * xsm = (const int32_t *)((const char *)xsc + ne11 * sizeof(float));
++                        const float xws = *(const float *)((const uint8_t *)src0->data + (ne00 * ne01 / 4));
++                        const int64_t nr = s1 - s0;
++                        float * tmp = (float *)alloca(nr * 4 * sizeof(float));
++
++                        int64_t c = t_npu;
++                        for (; c + 4 <= ne11; c += 4) {
++                            ggml_gemm_i2_i8_s(ne00, tmp, nr,
++                                (const char *)src0->data + s0 * nb01 / 4,
++                                (const char *)src1_wdata + src1_col_stride * c,
++                                4, nr);
++                            for (int64_t j = 0; j < 4; j++) {
++                                float * drow = (float *)((char *)dst->data + (c + j) * nb1) + s0;
++                                const float ps = xws / xsc[c + j];
++                                const int32_t as = xsm[c + j];
++                                for (int64_t r = 0; r < nr; r++)
++                                    drow[r] = (tmp[j * nr + r] - as) * ps;
++                            }
++                        }
++                        for (; c < ne11; c++) {
++                            ggml_gemv_i2_i8_s(ne00, tmp, ne01,
++                                (const char *)src0->data + s0 * nb01 / 4,
++                                (const char *)src1_wdata + src1_col_stride * c,
++                                1, nr);
++                            float * drow = (float *)((char *)dst->data + c * nb1) + s0;
++                            const float ps = xws / xsc[c];
++                            const int32_t as = xsm[c];
++                            for (int64_t r = 0; r < nr; r++)
++                                drow[r] = (tmp[r] - as) * ps;
++                        }
++                    }
++                }
++
++                ggml_barrier(params->threadpool);
++
++                if (atomic_load(&xdna_result)) {
++                    // Convert the NPU's int32 accumulators for tokens [0, t_npu),
++                    // sharded over every thread: it is ne01*t_npu elements of pure
++                    // bandwidth and single-threading it costs more than the kernel.
++                    const float * xs  = (const float *)((const char *)src1_wdata + (ne11 * ne10));
++                    const float   xws = *(const float *)((const uint8_t *)src0->data + (ne00 * ne01 / 4));
++                    const int64_t rb  = (ith       * t_npu) / nth;
++                    const int64_t re  = ((ith + 1) * t_npu) / nth;
++                    bitnet_xdna_epilogue(ne01, rb, re, xs, xws, (float *)dst->data, nb1);
++                    // The accumulator buffer is shared: no thread may leave before
++                    // every reader is done with it.
++                    ggml_barrier(params->threadpool);
++                    // Every reader is now done, so the invocation's output slots
++                    // may be handed to another context.
++                    if (ith == 0) bitnet_xdna_invocation_end();
++                    return;
++                }
++                // NPU failed. The CPU threads already produced [t_npu, ne11), but
++                // the block below recomputes it identically, so falling through is
++                // correct -- just wasted work on a path that should not occur.
++                if (ith == 0) bitnet_xdna_invocation_end();
++            }
++        }
++#endif
+ 
+         const int64_t matmul_num_cols = 4; // gemm processes 4 columns at a time
+         int64_t src0_start = (ith * ne01) / nth;
+@@ -3228,6 +3356,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++#ifdef GGML_BITNET_PROFILE
++    if (state->ith == 0 && bnp_enabled()) bnp_graph_begin(cgraph->n_nodes);
++#endif
++
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+@@ -3240,6 +3372,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++#ifdef GGML_BITNET_PROFILE
++        // Thread 0 brackets the node. Every node is computed by all threads and
++        // followed by ggml_barrier(), so [begin, after-barrier) on thread 0 is
++        // this node's true wall-clock contribution and the intervals tile the
++        // graph. Runtime-gated by BITNET_PROFILE; unset costs two branches.
++        const int bnp_idx = node_n;
++        const bool bnp_rec = (state->ith == 0) && bnp_enabled();
++        if (bnp_rec) bnp_node_begin(bnp_idx);
++#endif
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3258,6 +3400,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++
++#ifdef GGML_BITNET_PROFILE
++        // After the barrier: all threads have finished this node.
++        if (bnp_rec) bnp_node_end(bnp_idx, node);
++#endif
+     }
+ 
+ #ifdef GGML_USE_OPENMP

@@ -1,0 +1,18 @@
+# native build products — rebuilt by native/Makefile
+*.so
+*.o
+*.a
+native/smoke
+target/
+.cpcache/
+.jolt/
+
+# never commit model weights or state blobs
+*.gguf
+*.bin
+*.state
+models/
+
+# local scratch
+/tmp/
+*.log

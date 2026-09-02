@@ -1,0 +1,127 @@
+/*
+ * C smoke test for the jolt_llama shim.
+ *
+ * Runs the whole vertical slice WITHOUT Jolt, so a failure here is
+ * unambiguously the shim or libllama and never the FFI layer. When the Jolt
+ * side later disagrees with this program on the same model, the difference is
+ * the binding.
+ *
+ * It also prints a reference top-k that the Jolt test compares against, which
+ * is what makes the M0 acceptance ("compared to an independent reference from
+ * the same build") mean something.
+ *
+ *   ./smoke <model.gguf> [prompt]
+ */
+#include "jolt_llama.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int fail(const char *what, jl_status st) {
+    char err[512];
+    jl_last_error(err, sizeof(err));
+    fprintf(stderr, "FAIL %s: status=%d err=%s\n", what, (int) st, err);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: %s <model.gguf> [prompt]\n", argv[0]); return 2; }
+    const char *path   = argv[1];
+    const char *prompt = argc > 2 ? argv[2] : "The capital of France is";
+
+    printf("abi_version=%d\n", jl_abi_version());
+
+    jl_status st;
+    if ((st = jl_runtime_init()) != JL_OK) return fail("runtime_init", st);
+
+    jl_model_params mp;
+    jl_model_params_default(&mp);
+    jl_model *model = NULL;
+    if ((st = jl_model_open(path, &mp, &model)) != JL_OK) return fail("model_open", st);
+
+    char desc[256];
+    jl_model_desc(model, desc, sizeof(desc));
+    printf("model=%s\nn_vocab=%d n_ctx_train=%d\n",
+           desc, jl_model_n_vocab(model), jl_model_n_ctx_train(model));
+
+    jl_session_params sp;
+    jl_session_params_default(&sp);
+    sp.n_ctx = 4096;
+    sp.n_threads = 4;
+    sp.n_threads_batch = 4;
+    jl_session *sess = NULL;
+    if ((st = jl_session_new(model, &sp, &sess)) != JL_OK) return fail("session_new", st);
+
+    /* two-call sizing, then the real tokenize */
+    size_t n_tok = 0;
+    if ((st = jl_tokenize(model, prompt, strlen(prompt), 1, 0, NULL, 0, &n_tok)) != JL_OK)
+        return fail("tokenize(size)", st);
+    int32_t *toks = (int32_t *) malloc(n_tok * sizeof(int32_t));
+    if ((st = jl_tokenize(model, prompt, strlen(prompt), 1, 0, toks, n_tok, &n_tok)) != JL_OK)
+        return fail("tokenize", st);
+
+    printf("n_tokens=%zu tokens=", n_tok);
+    for (size_t i = 0; i < n_tok && i < 16; i++) printf("%d ", toks[i]);
+    printf("\n");
+
+    if ((st = jl_eval(sess, 0, toks, n_tok, 0)) != JL_OK) return fail("eval", st);
+
+    size_t n_logits = 0;
+    if ((st = jl_logits(sess, NULL, 0, &n_logits)) != JL_OK) return fail("logits(size)", st);
+    printf("n_logits=%zu\n", n_logits);
+
+    /* the reference the Jolt test must reproduce */
+    const int K = 10;
+    int32_t tk[16]; float lp[16];
+    size_t n_top = 0;
+    if ((st = jl_logits_topk(sess, K, tk, lp, &n_top)) != JL_OK) return fail("logits_topk", st);
+
+    printf("topk:\n");
+    for (size_t i = 0; i < n_top; i++) {
+        char piece[64]; size_t np = 0;
+        jl_token_to_piece(model, tk[i], piece, sizeof(piece), &np);
+        piece[np < sizeof(piece) ? np : sizeof(piece) - 1] = '\0';
+        printf("  %2zu  token=%-8d logprob=%.6f  piece=%s\n", i, tk[i], lp[i], piece);
+    }
+
+    /* state round trip, exercised here so a Jolt-side failure is isolable */
+    size_t n_state = 0;
+    if ((st = jl_state_size(sess, 0, &n_state)) != JL_OK) return fail("state_size", st);
+    printf("state_bytes=%zu\n", n_state);
+
+    uint8_t *blob = (uint8_t *) malloc(n_state);
+    size_t written = 0;
+    if ((st = jl_state_save(sess, 0, blob, n_state, &written)) != JL_OK) return fail("state_save", st);
+    printf("state_saved=%zu\n", written);
+
+    if ((st = jl_session_clear(sess, 0)) != JL_OK) return fail("session_clear", st);
+    size_t nread = 0;
+    if ((st = jl_state_load(sess, 0, blob, written, &nread)) != JL_OK) return fail("state_load", st);
+    printf("state_loaded=%zu\n", nread);
+
+    /*
+     * Negative path: logits must be refused immediately after a restore,
+     * because nothing has been evaluated on top of the restored state yet.
+     * Getting a stale buffer here is precisely the bug this guard prevents.
+     */
+    size_t dummy = 0;
+    st = jl_logits(sess, NULL, 0, &dummy);
+    printf("logits_after_restore_status=%d (expect %d JL_ERR_NO_LOGITS)\n", (int) st, (int) JL_ERR_NO_LOGITS);
+    if (st != JL_ERR_NO_LOGITS) { fprintf(stderr, "FAIL: expected JL_ERR_NO_LOGITS\n"); return 1; }
+
+    /* invalid-argument paths must be status codes, never crashes */
+    if (jl_model_open(NULL, NULL, &model) != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null path accepted\n"); return 1; }
+    if (jl_eval(sess, 0, NULL, 0, 0)   != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null tokens accepted\n"); return 1; }
+    if (jl_eval(NULL, 0, toks, 1, 0)   != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: null session accepted\n"); return 1; }
+    printf("negative_paths=ok\n");
+
+    free(blob); free(toks);
+    if ((st = jl_session_close(sess))  != JL_OK) return fail("session_close", st);
+    if ((st = jl_model_close(model))   != JL_OK) return fail("model_close", st);
+    if ((st = jl_runtime_free())       != JL_OK) return fail("runtime_free", st);
+    if (jl_runtime_free() != JL_ERR_INVALID_ARG) { fprintf(stderr, "FAIL: unbalanced runtime_free accepted\n"); return 1; }
+
+    printf("SMOKE OK\n");
+    return 0;
+}

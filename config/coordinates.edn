@@ -1,0 +1,65 @@
+;; Exact coordinates for reproducing this work. Recorded per AGENTS.md: "Work
+;; from exact pinned revisions. Record every source, toolchain, model, prompt,
+;; seed, and artifact coordinate needed to reproduce the result."
+{:bootstrap
+ {:repo "casselc/samizdat-agent-bootstrap"
+  :branch "bootstrap-finalize"
+  :sha "7295eb5b64a0c15f4f043ace8dbb9f1dcdee3eb1"
+  :verified true}
+
+ :jolt
+ {:repo "casselc/jolt"
+  :tag "v0.8.0"
+  :sha "ccd6a73f"
+  :installed-to "$HOME/.local/bin/jolt"
+  ;; DEVIATION FROM config/repos.lock.tsv, recorded per AGENTS.md.
+  ;; The lock pins 33a1bfc44010c0a3dd61ba6dce8e67303ffe0cff, which reports
+  ;; itself as v0.7.28-39-g33a1bfc4 -- BELOW config/toolchain.env's
+  ;; JOLT_MIN_VERSION=0.8.0. The work order raised the floor to 8, so v0.8.0
+  ;; is used. v0.8.0 is a strict descendant of the lock pin.
+  :lock-pin "33a1bfc44010c0a3dd61ba6dce8e67303ffe0cff"
+  :override-reason "toolchain.env floor is 0.8.0; lock pin predates it"}
+
+ :llama-cpp
+ {;; Recovered from the frozen Halo evidence, NOT guessed. This is the build
+  ;; the exact-spine gate ran on.
+  :upstream-of "isHuangXin/llama.cpp (BitNet fork), vendored at BitNet/3rdparty/llama.cpp"
+  :sha "390c307752ab78fd8189f359d6954c9ba1be74af"
+  :subject "Fix build-cann workflow by adding placeholder job"
+  ;; IMPORTANT: the coordinate is NOT a clean SHA. The working tree carries
+  ;; uncommitted BitNet CPU-kernel changes (+164 lines across
+  ;; ggml/src/ggml-cpu/{CMakeLists.txt,ggml-cpu.c}). The diff is captured at
+  ;; docs/llamacpp-worktree.diff so the build is reproducible.
+  :working-tree-dirty true
+  :worktree-diff "docs/llamacpp-worktree.diff"
+  :build-flags ["-DCMAKE_BUILD_TYPE=Release" "-DGGML_NATIVE=ON" "-DGGML_OPENMP=ON"
+                "-DGGML_VULKAN=OFF" "-DLLAMA_CURL=OFF" "-DBUILD_SHARED_LIBS=ON"]
+  :note "XDNA/NPU offload is compiled out; this pass is CPU-only by design."}
+
+ :halo-evidence
+ {:repo "casselc/bitnet-xdna2-strix-halo"
+  :branch "exact-spine-runtime-gate"
+  :sha "c851c733147a2f4ba6a83c27d2566870d1a9a3cd"
+  :provides "exact-spine reuse result and the token-identity requirement"}
+
+ :models
+ {:primary   {:name "Qwen3.5-0.8B"
+              :file "qwen3.5-0.8b-q4_0.gguf"
+              :hf "ggml-org/Qwen3.5-0.8B-GGUF"
+              :hf-rev "8fea620810c4afa23dd6443f999a48574c1611a3"
+              :desc "qwen35 0.8B Q4_0"
+              :n-vocab 248320
+              :n-ctx-train 262144
+              :why "hybrid (6 attn + 18 DeltaNet); the model the Halo gate validated"}
+  :control   {:name "BitNet-b1.58-2B-4T"
+              :file "ggml-model-i2_s.gguf"
+              :why "pure-attention known-good control"}}
+
+ :toolchain
+ {:chez "10.4.1 (threaded)"
+  :chez-note "/usr/local/bin/chez is broken (cannot find chez.boot); /usr/local/bin/scheme works. Jolt's probe only tries chez/chezscheme, so JOLT_CHEZ=/usr/local/bin/scheme is required to build from source."
+  :gcc "14.2.0 (fetched by the Jolt build into .cache/local)"
+  :libuuid "uuid-dev 2.41.3 extracted to $HOME/.local; Jolt's launcher links -luuid and no system dev package was present"
+  :cmake "4.2.3"
+  :os "Ubuntu 26.04, kernel 7.0.0-29-generic"
+  :cpu "AMD Ryzen AI MAX+ 395 (Strix Halo), 16C/32T"}}
