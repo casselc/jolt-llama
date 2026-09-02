@@ -1025,6 +1025,68 @@
               (throw (ex-info "a replayed base produced a different ranking"
                               {:hegel/origin "c6/round-trip"}))))))))))
 
+
+(defn check-scoring-failure-is-atomic! [runner]
+  (report/run!
+   runner
+   "C7: a failure during candidate scoring restores the base or poisons the session"
+   (fn []
+     (h/run-test!
+      {:test-cases 10 :database "" :verbosity :quiet}
+      (fn [_]
+        ;; Candidate scoring moves native state. An exception partway through
+        ;; used to skip the final restore, leaving the session advanced past its
+        ;; base while the token ledger still claimed the base -- the exact
+        ;; desynchronisation every later append-only check reads.
+        ;;
+        ;; The failure is injected AFTER at least one candidate has moved native
+        ;; state, by giving a later candidate an out-of-range token.
+        (let [s state-session
+              toks (vec (tok (probe-text 4)))
+              _ (llama/clear! s)
+              _ (llama/eval! s toks)
+              st (llama/save-state s)
+              top (llama/top-k s 2 {:pieces? false})
+              n-vocab (:n-vocab model)
+              bad-token (+ n-vocab 1000)
+              cands [{:id :ok    :tokens [(:token (first top)) (:token (second top))]}
+                     {:id :boom  :tokens [(:token (first top)) bad-token]}]
+              outcome (try (llama/score-candidates s cands {:state st}) :NO-FAILURE
+                           (catch Throwable e (:jolt.llama/error (ex-data e))))]
+          (cond
+            ;; the model may tolerate the token; then there is nothing to assert
+            (= :NO-FAILURE outcome) nil
+
+            (= :score/failed-base-restored outcome)
+            ;; the contract: base restored, ledger agrees, session usable
+            (do
+              (when-not (= toks @(:tokens s))
+                (throw (ex-info "the base was not restored after a scoring failure"
+                                {:hegel/origin "c7/base-restored"})))
+              (when-not (= :open @(:state s))
+                (throw (ex-info "the session was poisoned despite a successful restore"
+                                {:hegel/origin "c7/not-poisoned-when-recovered"})))
+              ;; and it still works
+              (llama/eval! s [(:token (first top))])
+              (when-not (pos? (count (llama/top-k s 2 {:pieces? false})))
+                (throw (ex-info "session unusable after a recovered scoring failure"
+                                {:hegel/origin "c7/usable-after-recovery"}))))
+
+            (= :score/failed-session-poisoned outcome)
+            ;; the other legal contract: explicitly poisoned, refusing further use
+            (do
+              (when-not (= :poisoned @(:state s))
+                (throw (ex-info "reported poisoned but the handle says otherwise"
+                                {:hegel/origin "c7/poison-is-visible"})))
+              (when-not (try (llama/eval! s [1]) false
+                             (catch Throwable _ true))
+                (throw (ex-info "a poisoned session accepted further evaluation"
+                                {:hegel/origin "c7/poisoned-refuses"}))))
+
+            :else
+            (throw (ex-info "a scoring failure produced an undefined outcome"
+                            {:hegel/origin "c7/defined-outcome" :got outcome})))))))))
+
 ;; ----------------------------------------------------------------- main
 
 (defn -main [& _]
@@ -1052,6 +1114,7 @@
     (check-same-tokens-different-numerical-base-refused! runner)
     (check-stale-base-logprobs-refused! runner)
     (check-base-logprobs-round-trip! runner)
+    (check-scoring-failure-is-atomic! runner)
     (check-single-token-path-is-state-free! runner)
     (check-scoring-leaves-the-session-untouched! runner)
 

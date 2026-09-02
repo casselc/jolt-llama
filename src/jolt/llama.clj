@@ -92,7 +92,8 @@
    -10 :error/no-logits
    -11 :model/sessions-active
    -12 :seq/unsupported
-   -13 :state/not-append})
+   -13 :state/not-append
+   -14 :session/poisoned})
 
 (defn- last-error-text []
   (let [n (c-last-error ffi/null 0)]
@@ -922,11 +923,16 @@
   :base-logprobs is likewise a descriptor bound to its origin rather than a
   bare map that could carry scores from another base.
 
-  It stays experimental because failure ATOMICITY is unresolved: an exception
-  partway through candidate scoring can skip the final restore, leaving the
-  session advanced past its base. Until that is either restored reliably or
-  surfaced as an explicit poisoned state, do not build on multi-token scoring
-  as if it carried the same proof as the single-token path.
+  Failure atomicity is now defined too: a failure during candidate realisation
+  restores the base, and if the restore itself fails the session is marked
+  :poisoned and refuses further use rather than being handed back looking
+  healthy. Property C7 injects a failure after a candidate has already moved
+  native state and asserts one of those two outcomes.
+
+  It remains EXPERIMENTAL because its guarantees rest on identity checks and a
+  recovery path rather than on the structural argument the single-token path
+  has -- that path cannot desynchronise because it never moves native state at
+  all. Prefer single-token action vocabularies where the choice exists.
 
   The caller must already have evaluated the base context (spine, or spine plus
   delta) so logits are available. Each candidate is {:id any :tokens [ids...]}.
@@ -1077,9 +1083,19 @@
          base-lp (if base-logprobs
                    (select-keys (:scores base-logprobs) first-tokens)
                    (into {} (map (fn [t] [t (token-logprob session t)]) first-tokens)))
+         ;; FAILURE ATOMICITY. Candidate scoring moves native state, so an
+         ;; exception partway through used to skip the final restore and leave
+         ;; the session advanced past its base -- with the token ledger still
+         ;; claiming the base, which is the desynchronisation every later
+         ;; append-only check reads. The whole realisation is wrapped: on any
+         ;; failure the base is restored, and if the restore ITSELF fails the
+         ;; session is marked poisoned rather than handed back looking healthy.
+         restore-base!
+         (fn [] (when multi? (load-state! session state (:tokens state) {:seq-id seq-id})))
          scored
-         (doall
-          (for [{:keys [id tokens] :as cand} candidates]
+         (try
+          (doall
+           (for [{:keys [id tokens] :as cand} candidates]
             (let [toks (vec tokens)
                   lps (if (= 1 (count toks))
                         [(get base-lp (first toks))]
@@ -1101,6 +1117,23 @@
                      :logprob-sum total
                      :logprob-mean (/ total (count toks))
                      :token-logprobs lps))))
+          (catch Throwable e
+            (let [recovered?
+                  (try (restore-base!) true
+                       (catch Throwable _ false))]
+              (when-not recovered?
+                ;; the session's ledger and native state may now disagree and
+                ;; nothing here can reconcile them; say so loudly
+                (reset! (:state session) :poisoned))
+              (throw (ex-info (str "jolt.llama/score-candidates: failed during candidate "
+                                   "realisation; base "
+                                   (if recovered? "restored" "NOT restored, session poisoned"))
+                              {:jolt.llama/op :score-candidates
+                               :jolt.llama/error (if recovered?
+                                                   :score/failed-base-restored
+                                                   :score/failed-session-poisoned)
+                               :jolt.llama/cause (ex-message e)}
+                              e)))))
          ranked (->> scored
                      (sort-by :logprob-sum >)
                      (map-indexed (fn [i c] (assoc c :rank i)))
@@ -1116,8 +1149,7 @@
      ;; enforced above, and load-state! sets the ledger from the state it
      ;; restored. Only needed at all if a multi-token candidate advanced the
      ;; sequence; the single-token path never moves native state.
-     (when multi?
-       (load-state! session state (:tokens state) {:seq-id seq-id}))
+     (restore-base!)
      {:candidates ranked
       :best (first ranked)
       :n-candidates (count ranked)

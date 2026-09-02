@@ -110,7 +110,16 @@ typedef enum {
      * into the middle would leave the session's state and its token ledger
      * describing different things.
      */
-    JL_ERR_NOT_APPEND     = -13
+    JL_ERR_NOT_APPEND     = -13,
+    /*
+     * A previous jl_eval failed partway through its chunks, so earlier chunks
+     * had already mutated the context while n_resident still described the
+     * state before the call. The ledger and the context disagree and nothing
+     * at this layer can reconcile them, so the session refuses everything but
+     * jl_session_clear (which makes them agree again, both empty) and
+     * jl_session_close.
+     */
+    JL_ERR_POISONED       = -14
 } jl_status;
 
 /*

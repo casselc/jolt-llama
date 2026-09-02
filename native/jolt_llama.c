@@ -71,6 +71,13 @@ struct jl_session {
      */
     int32_t               n_resident;
     /*
+     * Set when a partial native failure has left n_resident and the context
+     * describing different sequences. A poisoned session refuses everything
+     * but clear and close: continuing would evaluate against state nobody can
+     * describe.
+     */
+    int                   poisoned;
+    /*
      * Whether the most recent jl_eval produced logits. Asking for logits before
      * any eval is a caller error we can report precisely instead of handing
      * back a stale or uninitialised buffer.
@@ -335,6 +342,9 @@ jl_status jl_session_clear(jl_session *session, int32_t seq_id) {
     }
     llama_memory_t mem = llama_get_memory(session->ctx);
     llama_memory_seq_rm(mem, 0, -1, -1);
+    /* clear is the documented recovery from a poisoned session: after it the
+     * ledger and the context agree again, both empty */
+    session->poisoned = 0;
     session->have_logits = 0;
     /* nothing resident means the next eval must start at 0 */
     session->n_resident = 0;
@@ -417,6 +427,12 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
         return JL_ERR_NOT_APPEND;
     }
 
+    if (session->poisoned) {
+        jl_set_error("jl_eval: session is poisoned by an earlier partial failure; "
+                     "clear or close it");
+        return JL_ERR_POISONED;
+    }
+
     const uint32_t n_ctx = llama_n_ctx(session->ctx);
     if ((size_t) pos0 + n_tokens > (size_t) n_ctx) {
         jl_set_error("jl_eval: pos0 %d + %zu tokens exceeds n_ctx %u", pos0, n_tokens, n_ctx);
@@ -471,7 +487,23 @@ jl_status jl_eval(jl_session *session, int32_t seq_id,
         llama_batch_free(batch);
         if (rc != 0) {
             session->have_logits = 0;
-            jl_set_error("llama_decode failed (%d) at offset %zu", rc, off);
+            /*
+             * PARTIAL FAILURE. Earlier chunks have already mutated the context
+             * while n_resident still describes the state before this call, so
+             * the ledger and the native context now disagree -- and every
+             * later append-only check reads that ledger. Leaving it is how a
+             * caller silently evaluates against a sequence that no longer
+             * exists.
+             *
+             * The session is POISONED rather than guessed at. There is no
+             * checkpoint to roll back to at this layer, and clearing would
+             * discard state the caller may still be able to account for, so
+             * the honest move is to refuse everything except clear and close.
+             */
+            session->poisoned = 1;
+            jl_set_error("llama_decode failed (%d) at offset %zu of %zu; "
+                         "session is poisoned: %zu chunk(s) already applied",
+                         rc, off, n_tokens, ci);
             return JL_ERR_DECODE;
         }
         off += chunk;
@@ -592,6 +624,10 @@ jl_status jl_state_save(jl_session *session, int32_t seq_id,
     if (seq_id != 0) {
         jl_set_error("jl_state_save: seq_id %d unsupported; v0 is single-sequence", seq_id);
         return JL_ERR_SEQ_UNSUPPORTED;
+    }
+    if (session->poisoned) {
+        jl_set_error("jl_state_save: session is poisoned; clear or close it");
+        return JL_ERR_POISONED;
     }
     size_t need = llama_state_seq_get_size(session->ctx, (llama_seq_id) seq_id);
     *n_out = need;
