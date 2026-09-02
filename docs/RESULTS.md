@@ -452,15 +452,42 @@ base log-probability.
 state one only read the first 4096 bytes. Nothing about that is a content
 identity, and the earlier name (`sha256-hex`) implied one.
 
-**Option B, and it is forced rather than preferred.** A real SHA-256 over the
-blob needs a digest primitive; jolt-llama's core runs on stock Jolt with
-top-level `:deps {}`, and taking a crypto dependency to hash an in-process
-descriptor would trade the library's central property for an identity nothing
-yet persists. Renamed to `:token-check` / `:state-check`, with
-`:state/token-check-mismatch` and `:state/blob-check-mismatch`, and documented
-as **local integrity sentinels — not durable content identity**. When a state
-crosses a persistence or process boundary it needs a real digest, and that is
-the point at which to add one.
+At the time this was written the conclusion was Option B — keep the cheap
+checks, rename them honestly to `:token-check` / `:state-check`.
+
+**SUPERSEDED. They are real SHA-256 digests now.** The reasoning above was
+over-constrained: the requirement was that the core run on *stock Jolt*, and
+`:deps {}` was an implementation of that which I then treated as the
+requirement. jolt-crypto is a first-party library, not a runtime patch.
+
+Measuring changed the answer again. jolt-crypto works, but on the sizes that
+matter it is ~1 MB/s — FFI marshalling, not OpenSSL:
+
+| input | via jolt-crypto |
+| --- | ---: |
+| token vector, 11 KB | 2 ms |
+| state blob, 52 MiB | **~47 000 ms** |
+
+So the dependency was never the obstacle; moving 52 MiB through an FFI to reach
+it is. The shim already holds the blob in native memory, where SHA-256 costs
+~350 ms and needs no dependency at all. `jl_sha256_hex` is FIPS 180-4 in ~130
+lines, checked against the published vectors in `smoke.c` before anything trusts
+it — which caught a two-block padding bug that passed the empty and `"abc"`
+vectors and failed the 56-byte one.
+
+The fields are `:token-sha256` (over the canonical little-endian int32 encoding)
+and `:state-sha256` (over the whole blob), with
+`:state/token-digest-mismatch` and `:state/blob-digest-mismatch`.
+
+**One trade, stated because it is a real weakening.** The token digest is
+verified on every restore (~2 ms). The blob digest is verified only when the
+state did not originate in the restoring session: candidate rewind restores once
+per multi-token candidate, and verifying each time cost ~345 ms and took the
+exact-spine speedup from 3.92x to 3.00x, to detect only memory corruption of an
+immutable in-process array this library created and never hands out.
+`verify-state-digest` forces the full check.
+
+  save-state 376 → 729 ms; load-state! and restore+delta unchanged.
 
 ## P1-5 — the v0 concurrency contract
 
@@ -472,10 +499,22 @@ concurrent calls actually happen — two `finally` blocks, a shutdown hook racin
 a worker. The handle carries a state atom moved only by `compare-and-set!`:
 
     :open --CAS--> :closing --> :closed
+                            or  :close-failed   (native close threw)
 
 Only the thread that wins `:open -> :closing` calls native free. A boolean could
 not express this: read-then-write left a window where two threads both saw
 `false`, both wrote `true`, and both called free on one pointer.
+
+`:close-failed` is terminal, so a native close that throws cannot strand the
+handle at `:closing` where every later caller would be told `:already-closed`
+about a resource that was never freed. It is **defensive and untested**: no
+valid close has a practical failure path, and reaching it would need a second
+shipped fault-injection hook. Recorded as a known gap rather than claimed as
+covered.
+
+`init-runtime!` is CAS'd the same way — it was read-then-write, so N threads
+opening their first model could all call `jl_runtime_init`, whose native
+refcount is a plain int.
 
 The native runtime refcount is **not** thread-safe and is not part of ordinary
 handle lifecycle — Jolt initialises the runtime once, on first model open, and
@@ -484,11 +523,23 @@ never frees it. Stated rather than defended with a lock nothing needs yet.
 ## The state compatibility coordinate, in full
 
     { shim ABI version
-      native runtime build id      llama.cpp:<sha>:clean
+      native runtime build id      llama.cpp:<sha>:clean, and an
+                                   unattributable "unknown:" id never matches,
+                                   not even another "unknown:"
       model content SHA-256        of the GGUF, computed once at open
       sequence id                  0 in v0
-      exact token vector           plus an integrity sentinel
-      native state byte count      plus a sampled integrity sentinel }
+      exact token vector           plus its SHA-256
+      native state byte count      plus the blob's SHA-256
+
+      and, for a candidate-rewind checkpoint only:
+      originating session id
+      unique per-save state id     the session must be sitting ON it }
+
+Token equality is not NUMERICAL equality — the same token vector reached by a
+different call structure produces different logits below the calibrated append
+threshold — so a rewind checkpoint needs an evaluation identity, not just
+matching tokens. A monotonic counter was tried first and was wrong: restoring
+rewound it, so two divergent evaluations could share a number.
 
 Every one is checked **before** the native state load, because
 `llama_state_seq_set_data` given a foreign blob does not reliably fail — it can
